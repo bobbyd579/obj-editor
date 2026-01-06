@@ -1,0 +1,6 @@
+numpy>=1.21.0
+PyOpenGL>=3.1.6
+glfw>=2.5.0
+Pillow>=9.0.0
+# PyOpenGL-accelerate>=3.1.6  # Optional - requires C++ build tools. PyOpenGL works without it.
+
