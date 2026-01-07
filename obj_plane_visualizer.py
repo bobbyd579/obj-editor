@@ -73,6 +73,14 @@ class OBJPlaneVisualizer:
         self.view_xz_flag = False  # Flag to set XZ plane view (side view)
         self.orthographic_view = None  # Current orthographic view: 'xy', 'yz', 'xz', or None for perspective
         self.pending_click = None  # (x, y, width, height) for screen-space selection
+        self.open_edges = []  # List of open edges: [(v1, v2), ...]
+        self.show_open_edges = True  # Flag to show/hide open edges
+        self.edge_loops = []  # List of edge loops: [[(v1, v2), (v2, v3), ...], ...]
+        self.selected_loops = set()  # Set of loop indices that are selected
+        self.pending_edge_click = None  # (x, y, width, height) for edge selection
+        self.edge_loop_selection_mode = False  # True = select edge loops, False = select vertices
+        self.open_edges = []  # List of open edges: [(v1, v2), ...]
+        self.show_open_edges = True  # Flag to show/hide open edges
         
     def select_obj_file(self):
         """Use tkinter to select OBJ file"""
@@ -186,6 +194,10 @@ class OBJPlaneVisualizer:
             
             self.vertices = np.array(self.vertices)
             self.calculate_bounding_box()
+            # Calculate open edges and loops after loading
+            self.open_edges = self.detect_open_edges()
+            self.edge_loops = self.find_edge_loops()
+            self.selected_loops = set()
             return True
             
         except Exception as e:
@@ -202,20 +214,552 @@ class OBJPlaneVisualizer:
         self.bbox_center = (self.bbox_min + self.bbox_max) / 2.0
         self.extents = self.bbox_max - self.bbox_min
     
+    def detect_open_edges(self):
+        """Detect open/boundary edges in the mesh.
+        An open edge is an edge that belongs to only one face.
+        Returns a list of tuples (v1, v2) representing open edges, where v1 < v2."""
+        if len(self.faces) == 0:
+            return []
+        
+        # Dictionary to count how many times each edge appears
+        # Edge is stored as (min(v1, v2), max(v1, v2)) to handle both directions
+        edge_count = {}
+        
+        # Extract edges from all faces
+        for face in self.faces:
+            face_vertices = face['vertices']
+            num_vertices = len(face_vertices)
+            
+            # Each face has edges between consecutive vertices
+            for i in range(num_vertices):
+                v1 = face_vertices[i]
+                v2 = face_vertices[(i + 1) % num_vertices]  # Wrap around for last edge
+                
+                # Store edge with smaller index first for consistency
+                edge = (min(v1, v2), max(v1, v2))
+                edge_count[edge] = edge_count.get(edge, 0) + 1
+        
+        # Find edges that appear only once (open edges)
+        open_edges = [edge for edge, count in edge_count.items() if count == 1]
+        
+        return open_edges
+    
+    def find_edge_loops(self):
+        """Find connected edge loops from open edges.
+        Returns a list of loops, where each loop is a list of edges in order."""
+        if len(self.open_edges) == 0:
+            return []
+        
+        # Build adjacency map: for each vertex, which edges connect to it
+        # Store edges normalized (min, max) for consistency
+        vertex_to_edges = {}
+        
+        # Create a set of all edges (normalized) for quick lookup
+        all_edges_set = set()
+        for edge in self.open_edges:
+            v1, v2 = edge
+            all_edges_set.add(edge)  # Already normalized (min, max)
+            
+            if v1 not in vertex_to_edges:
+                vertex_to_edges[v1] = []
+            if v2 not in vertex_to_edges:
+                vertex_to_edges[v2] = []
+            
+            # Store both directions for traversal
+            vertex_to_edges[v1].append(edge)
+            vertex_to_edges[v2].append(edge)
+        
+        loops = []
+        used_edges = set()
+        
+        # Find all loops - try each unused edge as a potential start
+        for start_edge in self.open_edges:
+            # Skip if this edge is already in a loop
+            if start_edge in used_edges:
+                continue
+            
+            # Start a new loop
+            loop = []
+            current_edge = start_edge
+            v1, v2 = current_edge
+            
+            # Traverse forward from start_edge
+            while current_edge not in used_edges:
+                used_edges.add(current_edge)
+                loop.append(current_edge)
+                
+                # Find next edge connected to v2 (the end vertex of current edge)
+                # Look for edges that connect to v2 but aren't the current edge
+                next_edge = None
+                for candidate_edge in vertex_to_edges.get(v2, []):
+                    # candidate_edge is normalized (min, max)
+                    if candidate_edge == current_edge:
+                        continue  # Skip the edge we're coming from
+                    
+                    # Check if this edge connects to v2
+                    cand_v1, cand_v2 = candidate_edge
+                    if cand_v1 == v2 or cand_v2 == v2:
+                        # This edge connects to v2
+                        if candidate_edge not in used_edges:
+                            next_edge = candidate_edge
+                            break
+                
+                if next_edge is not None:
+                    # Move to next edge
+                    current_edge = next_edge
+                    # Update v1, v2 for next iteration
+                    nv1, nv2 = current_edge
+                    # v2 should be the vertex we're coming from, v1 should be the new vertex
+                    if nv1 == v2:
+                        v1, v2 = nv1, nv2
+                    else:
+                        v1, v2 = nv2, nv1
+                else:
+                    # No more connected edges, this loop is complete
+                    break
+            
+            # Also try traversing backward from start_edge to complete the loop
+            # Find the starting vertex (v1 of start_edge) and see if we can continue backward
+            if len(loop) > 0:
+                # Get the first vertex of the start edge
+                start_v1, start_v2 = start_edge
+                # We traversed forward from v2, so try backward from v1
+                current_vertex = start_v1
+                
+                while True:
+                    # Find edge connected to current_vertex (going backward)
+                    prev_edge = None
+                    for candidate_edge in vertex_to_edges.get(current_vertex, []):
+                        if candidate_edge in used_edges:
+                            continue
+                        
+                        cand_v1, cand_v2 = candidate_edge
+                        if cand_v1 == current_vertex or cand_v2 == current_vertex:
+                            prev_edge = candidate_edge
+                            break
+                    
+                    if prev_edge is not None:
+                        used_edges.add(prev_edge)
+                        loop.insert(0, prev_edge)  # Add to beginning
+                        # Update current_vertex to the other end of prev_edge
+                        pv1, pv2 = prev_edge
+                        if pv1 == current_vertex:
+                            current_vertex = pv2
+                        else:
+                            current_vertex = pv1
+                    else:
+                        break
+            
+            if len(loop) > 0:
+                loops.append(loop)
+        
+        print(f"DEBUG: find_edge_loops found {len(loops)} loops from {len(self.open_edges)} open edges")
+        total_edges_in_loops = sum(len(loop) for loop in loops)
+        print(f"DEBUG: Total edges in loops: {total_edges_in_loops}, unused edges: {len(self.open_edges) - total_edges_in_loops}")
+        if len(loops) > 0:
+            print(f"DEBUG: Loop sizes: {[len(loop) for loop in loops]}")
+        
+        return loops
+    
+    def find_nearest_edge(self, mouse_x, mouse_y, width, height):
+        """Find the nearest open edge to the mouse position in screen space."""
+        if len(self.open_edges) == 0:
+            return None
+        
+        from OpenGL.GL import glGetDoublev, GL_MODELVIEW_MATRIX, GL_PROJECTION_MATRIX, GL_VIEWPORT
+        from OpenGL.GLU import gluProject
+        import ctypes
+        
+        # Get matrices and viewport (same way as vertex selection)
+        modelview = (ctypes.c_double * 16)()
+        projection = (ctypes.c_double * 16)()
+        viewport = (ctypes.c_int * 4)()
+        
+        glGetDoublev(GL_MODELVIEW_MATRIX, modelview)
+        glGetDoublev(GL_PROJECTION_MATRIX, projection)
+        glGetIntegerv(GL_VIEWPORT, viewport)
+        
+        # Convert viewport to tuple for gluProject (same as vertex selection)
+        vp_tuple = tuple(viewport)
+        vp_x, vp_y, vp_width, vp_height = vp_tuple
+        
+        selection_radius_pixels = 30.0  # Increased from 20 to match vertex selection
+        min_distance = float('inf')
+        nearest_edge = None
+        
+        for edge in self.open_edges:
+            v1_idx, v2_idx = edge
+            if v1_idx >= len(self.vertices) or v2_idx >= len(self.vertices):
+                continue
+            
+            v1 = self.vertices[v1_idx]
+            v2 = self.vertices[v2_idx]
+            
+            # Project both vertices to screen space
+            try:
+                result1 = gluProject(v1[0], v1[1], v1[2], modelview, projection, viewport)
+                result2 = gluProject(v2[0], v2[1], v2[2], modelview, projection, viewport)
+                
+                if result1 is None or result2 is None:
+                    continue
+                
+                win_x1, win_y1, win_z1 = result1
+                win_x2, win_y2, win_z2 = result2
+                
+                # Convert to screen coordinates (Y-axis flip) - same as vertex selection
+                screen_x1 = win_x1
+                screen_y1 = height - win_y1
+                screen_x2 = win_x2
+                screen_y2 = height - win_y2
+                
+                # Check if both vertices are in valid depth range
+                if not (0.0 <= win_z1 <= 1.0 and 0.0 <= win_z2 <= 1.0):
+                    continue
+                
+                # Calculate distance from mouse to edge (line segment)
+                # Vector from v1 to v2
+                dx = screen_x2 - screen_x1
+                dy = screen_y2 - screen_y1
+                edge_length_sq = dx * dx + dy * dy
+                
+                if edge_length_sq < 1e-6:  # Edge too short
+                    continue
+                
+                # Vector from v1 to mouse
+                mx = mouse_x - screen_x1
+                my = mouse_y - screen_y1
+                
+                # Project mouse onto edge
+                t = max(0.0, min(1.0, (mx * dx + my * dy) / edge_length_sq))
+                
+                # Closest point on edge
+                closest_x = screen_x1 + t * dx
+                closest_y = screen_y1 + t * dy
+                
+                # Distance from mouse to closest point
+                dist_x = mouse_x - closest_x
+                dist_y = mouse_y - closest_y
+                distance = np.sqrt(dist_x * dist_x + dist_y * dist_y)
+                
+                if distance < selection_radius_pixels and distance < min_distance:
+                    min_distance = distance
+                    nearest_edge = edge
+            except Exception as e:
+                # Debug: print error if needed
+                # print(f"Error in find_nearest_edge: {e}")
+                continue
+        
+        return nearest_edge
+    
+    def get_loop_index_for_edge(self, edge):
+        """Find which loop contains the given edge.
+        Edge can be in any format (min,max) or (v1,v2), we need to check both."""
+        # Normalize edge to (min, max) format for comparison
+        edge_normalized = (min(edge[0], edge[1]), max(edge[0], edge[1]))
+        
+        for i, loop in enumerate(self.edge_loops):
+            # Check all possible formats
+            for loop_edge in loop:
+                loop_edge_normalized = (min(loop_edge[0], loop_edge[1]), max(loop_edge[0], loop_edge[1]))
+                # Check if edges match (in normalized form)
+                if edge_normalized == loop_edge_normalized:
+                    return i
+        
+        return None
+    
+    def _find_loop_from_edge(self, start_edge):
+        """Find the loop containing the given edge by traversing connected edges.
+        Returns a list of edges in the loop."""
+        if start_edge not in self.open_edges:
+            return []
+        
+        # Build adjacency map
+        vertex_to_edges = {}
+        for edge in self.open_edges:
+            v1, v2 = edge
+            if v1 not in vertex_to_edges:
+                vertex_to_edges[v1] = []
+            if v2 not in vertex_to_edges:
+                vertex_to_edges[v2] = []
+            vertex_to_edges[v1].append(edge)
+            vertex_to_edges[v2].append(edge)
+        
+        loop = []
+        used_edges = set()
+        current_edge = start_edge
+        v1, v2 = start_edge
+        current_vertex = v2  # Start traversing from v2
+        
+        # Traverse forward
+        while current_edge not in used_edges:
+            used_edges.add(current_edge)
+            loop.append(current_edge)
+            
+            # Find next edge
+            next_edge = None
+            for candidate_edge in vertex_to_edges.get(current_vertex, []):
+                if candidate_edge == current_edge or candidate_edge in used_edges:
+                    continue
+                cand_v1, cand_v2 = candidate_edge
+                if cand_v1 == current_vertex or cand_v2 == current_vertex:
+                    next_edge = candidate_edge
+                    break
+            
+            if next_edge is not None:
+                current_edge = next_edge
+                nv1, nv2 = next_edge
+                if nv1 == current_vertex:
+                    current_vertex = nv2
+                else:
+                    current_vertex = nv1
+            else:
+                break
+        
+        # Traverse backward from start
+        if len(loop) > 0:
+            start_v1, start_v2 = start_edge
+            current_vertex = start_v1
+            
+            while True:
+                prev_edge = None
+                for candidate_edge in vertex_to_edges.get(current_vertex, []):
+                    if candidate_edge in used_edges:
+                        continue
+                    cand_v1, cand_v2 = candidate_edge
+                    if cand_v1 == current_vertex or cand_v2 == current_vertex:
+                        prev_edge = candidate_edge
+                        break
+                
+                if prev_edge is not None:
+                    used_edges.add(prev_edge)
+                    loop.insert(0, prev_edge)
+                    pv1, pv2 = prev_edge
+                    if pv1 == current_vertex:
+                        current_vertex = pv2
+                    else:
+                        current_vertex = pv1
+                else:
+                    break
+        
+        return loop
+    
+    def get_open_edge_info(self):
+        """Get information about open edges in the mesh.
+        Returns a dictionary with statistics about open edges."""
+        open_edges = self.detect_open_edges()
+        
+        # Count unique vertices that are part of open edges
+        vertices_on_boundary = set()
+        for v1, v2 in open_edges:
+            vertices_on_boundary.add(v1)
+            vertices_on_boundary.add(v2)
+        
+        return {
+            'num_open_edges': len(open_edges),
+            'num_boundary_vertices': len(vertices_on_boundary),
+            'open_edges': open_edges,
+            'boundary_vertices': vertices_on_boundary
+        }
+    
+    def flatten_selected_loops(self, axis):
+        """Flatten selected loops along the specified axis (0=X, 1=Y, 2=Z).
+        Sets all vertices in selected loops to the minimum value for that axis.
+        Returns (success, message) tuple."""
+        if len(self.selected_loops) == 0:
+            return False, "No loops selected"
+        
+        if axis not in [0, 1, 2]:
+            return False, "Invalid axis"
+        
+        axis_names = ['X', 'Y', 'Z']
+        
+        # Collect all vertices in selected loops
+        vertices_to_flatten = set()
+        for loop_idx in self.selected_loops:
+            if loop_idx < len(self.edge_loops):
+                loop = self.edge_loops[loop_idx]
+                for v1_idx, v2_idx in loop:
+                    vertices_to_flatten.add(v1_idx)
+                    vertices_to_flatten.add(v2_idx)
+        
+        if len(vertices_to_flatten) == 0:
+            return False, "No vertices found in selected loops"
+        
+        # Find minimum value for the axis across all selected vertices
+        min_value = float('inf')
+        for v_idx in vertices_to_flatten:
+            if v_idx < len(self.vertices):
+                value = self.vertices[v_idx][axis]
+                if value < min_value:
+                    min_value = value
+        
+        if min_value == float('inf'):
+            return False, "Could not determine minimum value"
+        
+        # Validate geometry BEFORE modifying (to avoid issues)
+        # We'll do a quick check - if flattening would create overlapping vertices, warn
+        # But we'll proceed anyway since the user wants to flatten
+        
+        # Flatten vertices
+        vertices_modified = 0
+        for v_idx in vertices_to_flatten:
+            if v_idx < len(self.vertices):
+                self.vertices[v_idx][axis] = min_value
+                vertices_modified += 1
+        
+        # Recalculate bounding box and open edges
+        # Do this in a try-except to prevent crashes
+        try:
+            self.calculate_bounding_box()
+            self.open_edges = self.detect_open_edges()
+            # Only recalculate loops if we have open edges and not too many (to avoid hanging)
+            if len(self.open_edges) > 0 and len(self.open_edges) < 10000:
+                self.edge_loops = self.find_edge_loops()
+            else:
+                # For large meshes, skip loop recalculation to prevent hanging
+                if len(self.open_edges) >= 10000:
+                    print(f"Warning: Too many open edges ({len(self.open_edges)}), skipping loop recalculation")
+                self.edge_loops = []
+        except Exception as e:
+            # If recalculation fails, log but don't crash
+            print(f"Warning: Error recalculating geometry after flattening: {e}")
+            # Still mark for redraw
+            pass
+        
+        self.needs_redraw = True
+        
+        return True, f"Flattened {vertices_modified} vertices along {axis_names[axis]} axis to {min_value:.6f}"
+    
+    def validate_geometry(self):
+        """Validate geometry for overlapping vertices and bad geometry.
+        Returns (is_valid, error_message) tuple.
+        Note: This is a quick check - for large meshes, it may skip some checks."""
+        if len(self.vertices) == 0:
+            return True, ""
+        
+        tolerance = 1e-6
+        
+        # For large meshes, skip expensive validation to prevent hanging
+        # Only check if mesh is reasonably sized
+        if len(self.vertices) > 10000:
+            # Just check for degenerate faces (faster)
+            degenerate_faces = []
+            for face_idx, face in enumerate(self.faces):
+                face_vertices = face['vertices']
+                if len(face_vertices) < 3:
+                    degenerate_faces.append(face_idx)
+                    continue
+                
+                # Check for duplicate vertices in face
+                if len(face_vertices) != len(set(face_vertices)):
+                    degenerate_faces.append(face_idx)
+            
+            if len(degenerate_faces) > 0:
+                return False, f"Found {len(degenerate_faces)} degenerate faces"
+            return True, ""
+        
+        # For smaller meshes, do full validation
+        # Check for overlapping vertices (within a small tolerance)
+        overlapping_pairs = []
+        
+        # Limit the number of checks to prevent hanging
+        max_checks = 1000000  # Limit to prevent O(n²) from hanging
+        check_count = 0
+        
+        for i in range(len(self.vertices)):
+            for j in range(i + 1, len(self.vertices)):
+                check_count += 1
+                if check_count > max_checks:
+                    # Too many vertices, skip detailed overlap check
+                    break
+                v1 = self.vertices[i]
+                v2 = self.vertices[j]
+                distance = np.linalg.norm(v1 - v2)
+                if distance < tolerance:
+                    overlapping_pairs.append((i, j))
+            if check_count > max_checks:
+                break
+        
+        if len(overlapping_pairs) > 0:
+            return False, f"Found {len(overlapping_pairs)} overlapping vertex pairs"
+        
+        # Check for degenerate faces (faces with zero area or duplicate vertices)
+        degenerate_faces = []
+        for face_idx, face in enumerate(self.faces):
+            face_vertices = face['vertices']
+            if len(face_vertices) < 3:
+                degenerate_faces.append(face_idx)
+                continue
+            
+            # Check for duplicate vertices in face
+            if len(face_vertices) != len(set(face_vertices)):
+                degenerate_faces.append(face_idx)
+                continue
+            
+            # Check for zero area (if we have at least 3 vertices)
+            if len(face_vertices) >= 3:
+                v1 = self.vertices[face_vertices[0]]
+                v2 = self.vertices[face_vertices[1]]
+                v3 = self.vertices[face_vertices[2]]
+                
+                edge1 = v2 - v1
+                edge2 = v3 - v1
+                cross_product = np.cross(edge1, edge2)
+                area = 0.5 * np.linalg.norm(cross_product)
+                
+                if area < tolerance:
+                    degenerate_faces.append(face_idx)
+        
+        if len(degenerate_faces) > 0:
+            return False, f"Found {len(degenerate_faces)} degenerate faces"
+        
+        return True, ""
+    
     def delete_selected_vertices(self):
-        """Delete all vertices within the plane threshold and faces that reference them, return deletion stats"""
+        """Delete vertices within the plane threshold that are only connected to other vertices in the selection.
+        Only deletes faces that are completely within the selection window."""
         # Use vertices within threshold (the red ones) instead of just the 3 selected vertices
         if not self.vertices_within_threshold:
             return None, None, None
         
         # Convert to set for faster lookup
-        vertices_to_delete = set(self.vertices_within_threshold)
+        selection_vertices = set(self.vertices_within_threshold)
+        all_vertices = set(range(len(self.vertices)))
+        outside_vertices = all_vertices - selection_vertices
         
-        # Find faces that reference any deleted vertex
+        # Build connectivity graph: for each vertex, find all vertices it's connected to via faces
+        vertex_connections = {}
+        for vertex_idx in range(len(self.vertices)):
+            vertex_connections[vertex_idx] = set()
+        
+        for face in self.faces:
+            face_vertex_indices = face['vertices']
+            # Each vertex in the face is connected to all other vertices in the face
+            for i, v1 in enumerate(face_vertex_indices):
+                for j, v2 in enumerate(face_vertex_indices):
+                    if i != j:
+                        vertex_connections[v1].add(v2)
+        
+        # Check each vertex in selection: only delete if it has NO connections to outside vertices
+        vertices_to_delete = set()
+        for vertex_idx in selection_vertices:
+            # Check if this vertex is connected to any vertex outside the selection
+            connected_to_outside = False
+            for connected_vertex in vertex_connections[vertex_idx]:
+                if connected_vertex in outside_vertices:
+                    connected_to_outside = True
+                    break
+            
+            # Only delete if not connected to any outside vertex
+            if not connected_to_outside:
+                vertices_to_delete.add(vertex_idx)
+        
+        # Find faces that are COMPLETELY within the deletable set (all vertices must be deletable)
         faces_to_remove = []
         for i, face in enumerate(self.faces):
             face_vertex_indices = face['vertices']
-            if any(v_idx in vertices_to_delete for v_idx in face_vertex_indices):
+            # Check if ALL vertices in this face are in the deletable set
+            if len(face_vertex_indices) > 0 and all(v_idx in vertices_to_delete for v_idx in face_vertex_indices):
                 faces_to_remove.append(i)
         
         # Remove faces (in reverse order to maintain indices)
@@ -278,6 +822,9 @@ class OBJPlaneVisualizer:
         # Recalculate bounding box
         if len(self.vertices) > 0:
             self.calculate_bounding_box()
+        
+        # Recalculate open edges after deletion
+        self.open_edges = self.detect_open_edges()
         
         # Clear selection after deletion
         deleted_vertex_count = len(vertices_to_delete)
@@ -565,45 +1112,89 @@ class OBJPlaneVisualizer:
         last_x, last_y = 0, 0
         mouse_down = False
         mouse_button = None
+        click_start_x, click_start_y = 0, 0
+        mouse_has_moved = False  # Track if mouse moved after click
         
         def mouse_button_callback(window, button, action, mods):
-            nonlocal mouse_down, mouse_button
+            nonlocal mouse_down, mouse_button, click_start_x, click_start_y, mouse_has_moved, last_x, last_y
             if action == glfw.PRESS:
                 mouse_down = True
                 mouse_button = button
+                mouse_has_moved = False  # Reset movement flag
+                
+                # Store click start position and update last position to prevent immediate panning
+                click_start_x, click_start_y = glfw.get_cursor_pos(window)
+                last_x, last_y = click_start_x, click_start_y  # Initialize to prevent false movement
                 
                 if button == glfw.MOUSE_BUTTON_LEFT:
                     # Get mouse position (window coordinates, top-left origin)
                     xpos, ypos = glfw.get_cursor_pos(window)
                     width, height = glfw.get_framebuffer_size(window)
                     
-                    # Store click for processing in render loop (after matrices are set up)
-                    # Note: glfw.get_cursor_pos gives window coordinates (top-left origin)
-                    # We'll convert to viewport coordinates in the selection function
-                    self.pending_click = (xpos, ypos, width, height)
+                    # Convert window coordinates to framebuffer coordinates (for high-DPI)
+                    # glfw.get_cursor_pos returns window coords, but we need framebuffer coords
+                    window_width, window_height = glfw.get_window_size(window)
+                    if window_width > 0 and window_height > 0:
+                        scale_x = width / window_width
+                        scale_y = height / window_height
+                        xpos_fb = xpos * scale_x
+                        ypos_fb = ypos * scale_y
+                    else:
+                        xpos_fb = xpos
+                        ypos_fb = ypos
+                    
+                    # Check current selection mode
+                    print(f"DEBUG: Mouse button pressed. Mode: {'Edge Loops' if self.edge_loop_selection_mode else 'Vertices'}")
+                    if self.edge_loop_selection_mode:
+                        # Edge loop selection mode
+                        self.pending_edge_click = (xpos_fb, ypos_fb, width, height)
+                        print(f"DEBUG: Set pending_edge_click = ({xpos_fb}, {ypos_fb}, {width}, {height})")
+                    else:
+                        # Vertex selection mode
+                        self.pending_click = (xpos_fb, ypos_fb, width, height)
             
             elif action == glfw.RELEASE:
+                # On release, if it was a click (no significant movement) and Shift was held, edge selection will be processed
                 mouse_down = False
                 mouse_button = None
+                mouse_has_moved = False
         
         def cursor_pos_callback(window, xpos, ypos):
-            nonlocal last_x, last_y, rotation_x, rotation_y, pan_x, pan_y
+            nonlocal last_x, last_y, rotation_x, rotation_y, pan_x, pan_y, mouse_has_moved, click_start_x, click_start_y
             if mouse_down:
-                dx = xpos - last_x
-                dy = ypos - last_y
+                # Check if mouse has moved significantly (more than 5 pixels from click start)
+                if not mouse_has_moved:
+                    move_distance = np.sqrt((xpos - click_start_x)**2 + (ypos - click_start_y)**2)
+                    if move_distance > 5.0:  # Threshold for considering it a drag
+                        mouse_has_moved = True
+                        # Clear pending clicks if we're dragging - this prevents edge/vertex selection
+                        if mouse_button == glfw.MOUSE_BUTTON_LEFT:
+                            if self.edge_loop_selection_mode:
+                                self.pending_edge_click = None
+                            else:
+                                self.pending_click = None
                 
-                # Right mouse button or Shift+Left = Pan
-                if mouse_button == glfw.MOUSE_BUTTON_RIGHT or \
-                   (mouse_button == glfw.MOUSE_BUTTON_LEFT and glfw.get_key(window, glfw.KEY_LEFT_SHIFT) == glfw.PRESS):
-                    # Pan - calculate pan speed based on zoom level and model size
-                    model_size = np.max(self.extents) if self.extents is not None else 1.0
-                    pan_speed = (model_size * 0.001) * zoom  # Pan more when zoomed in, scale with model size
-                    pan_x += dx * pan_speed
-                    pan_y -= dy * pan_speed
-                elif mouse_button == glfw.MOUSE_BUTTON_LEFT:
-                    # Rotate
-                    rotation_y += dx * 0.5
-                    rotation_x += dy * 0.5
+                    # Only pan/rotate if mouse has moved significantly (it's a drag, not a click)
+                    # Also check that dx/dy are non-zero to avoid panning on first callback
+                    if mouse_has_moved:
+                        dx = xpos - last_x
+                        dy = ypos - last_y
+                        
+                        # Only apply pan/rotate if there's actual movement (avoid first callback issue)
+                        if abs(dx) > 0.1 or abs(dy) > 0.1:
+                            # Right mouse button = Pan
+                            # Shift+Left (when dragging) = Pan (for convenience)
+                            if mouse_button == glfw.MOUSE_BUTTON_RIGHT or \
+                               (mouse_button == glfw.MOUSE_BUTTON_LEFT and glfw.get_key(window, glfw.KEY_LEFT_SHIFT) == glfw.PRESS):
+                                # Pan - calculate pan speed based on zoom level and model size
+                                model_size = np.max(self.extents) if self.extents is not None else 1.0
+                                pan_speed = (model_size * 0.001) * zoom  # Pan more when zoomed in, scale with model size
+                                pan_x += dx * pan_speed
+                                pan_y -= dy * pan_speed
+                            elif mouse_button == glfw.MOUSE_BUTTON_LEFT:
+                                # Rotate (only if not in edge loop selection mode, or if dragging)
+                                rotation_y += dx * 0.5
+                                rotation_x += dy * 0.5
             
             last_x, last_y = xpos, ypos
         
@@ -782,6 +1373,96 @@ class OBJPlaneVisualizer:
                 glRotatef(rotation_y, 0, 1, 0)
                 glTranslatef(-self.bbox_center[0], -self.bbox_center[1], -self.bbox_center[2])
             
+            # Process pending edge click for loop selection (after matrices are set up)
+            # Only process if it's still pending (wasn't cleared by drag)
+            if self.pending_edge_click is not None:
+                click_x, click_y, click_width, click_height = self.pending_edge_click
+                self.pending_edge_click = None  # Clear the pending click immediately
+                
+                print(f"DEBUG: Edge click received at ({click_x}, {click_y}), window size: {click_width}x{click_height}")
+                print(f"DEBUG: Open edges count: {len(self.open_edges)}, Edge loops count: {len(self.edge_loops)}")
+                
+                if len(self.open_edges) == 0:
+                    print("DEBUG: No open edges detected!")
+                    if self.gui:
+                        try:
+                            self.gui.root.after(0, lambda: messagebox.showwarning("Warning", "No open edges detected in the model. Make sure the OBJ file has been loaded."))
+                        except:
+                            pass
+                else:
+                    # Find nearest edge and select its loop
+                    nearest_edge = self.find_nearest_edge(click_x, click_y, click_width, click_height)
+                    
+                    if nearest_edge is not None:
+                        loop_idx = self.get_loop_index_for_edge(nearest_edge)
+                        
+                        if loop_idx is not None:
+                            # Toggle loop selection
+                            if loop_idx in self.selected_loops:
+                                self.selected_loops.remove(loop_idx)
+                            else:
+                                self.selected_loops.add(loop_idx)
+                            self.needs_redraw = True
+                            # Update GUI status
+                            if self.gui:
+                                try:
+                                    self.gui.root.after(0, self.gui.update_status)
+                                except:
+                                    pass
+                        else:
+                            # Edge not in any loop - find the loop containing this edge by traversing from it
+                            print(f"DEBUG: Edge {nearest_edge} not in any detected loop. Finding loop containing this edge...")
+                            
+                            # Build a loop starting from this edge
+                            loop_edges = self._find_loop_from_edge(nearest_edge)
+                            
+                            if len(loop_edges) > 0:
+                                # Check if this loop already exists (might be a duplicate)
+                                existing_loop_idx = None
+                                for i, existing_loop in enumerate(self.edge_loops):
+                                    if set(loop_edges) == set(existing_loop):
+                                        existing_loop_idx = i
+                                        break
+                                
+                                if existing_loop_idx is not None:
+                                    # Loop already exists, use it
+                                    loop_idx = existing_loop_idx
+                                else:
+                                    # New loop, add it
+                                    loop_idx = len(self.edge_loops)
+                                    self.edge_loops.append(loop_edges)
+                                    print(f"DEBUG: Created new loop {loop_idx} with {len(loop_edges)} edges")
+                                
+                                # Toggle selection
+                                if loop_idx in self.selected_loops:
+                                    self.selected_loops.remove(loop_idx)
+                                else:
+                                    self.selected_loops.add(loop_idx)
+                                self.needs_redraw = True
+                                if self.gui:
+                                    try:
+                                        self.gui.root.after(0, self.gui.update_status)
+                                    except:
+                                        pass
+                            else:
+                                # Couldn't find a loop - create a single-edge loop
+                                print(f"DEBUG: Could not find loop, creating single-edge loop for edge {nearest_edge}")
+                                new_loop_idx = len(self.edge_loops)
+                                self.edge_loops.append([nearest_edge])
+                                self.selected_loops.add(new_loop_idx)
+                                self.needs_redraw = True
+                                if self.gui:
+                                    try:
+                                        self.gui.root.after(0, self.gui.update_status)
+                                    except:
+                                        pass
+                    else:
+                        if self.gui:
+                            try:
+                                self.gui.root.after(0, lambda: messagebox.showinfo("Info", "No open edge found near the click position. Try clicking closer to the magenta edges."))
+                            except:
+                                pass
+            
             # Process pending click for vertex selection (after matrices are set up)
             if self.pending_click is not None:
                 click_x, click_y, click_width, click_height = self.pending_click
@@ -869,6 +1550,14 @@ class OBJPlaneVisualizer:
                     glVertex3f(v[0], v[1], v[2])
                 glEnd()
             
+            # Draw open edges if enabled
+            if self.show_open_edges and len(self.open_edges) > 0:
+                self._draw_open_edges()
+            
+            # Draw selected loops with different color
+            if len(self.selected_loops) > 0:
+                self._draw_selected_loops()
+            
             # Draw plane if defined
             if self.plane_equation is not None:
                 self._draw_plane()
@@ -941,6 +1630,26 @@ class OBJPlaneVisualizer:
             glVertex3f(corner[0], corner[1], corner[2])
         glEnd()
     
+    def _draw_selected_loops(self):
+        """Draw selected edge loops with highlighted color"""
+        if len(self.selected_loops) == 0 or len(self.vertices) == 0:
+            return
+        
+        glLineWidth(5.0)
+        glColor3f(0.0, 1.0, 1.0)  # Cyan color for selected loops
+        
+        glBegin(GL_LINES)
+        for loop_idx in self.selected_loops:
+            if loop_idx < len(self.edge_loops):
+                loop = self.edge_loops[loop_idx]
+                for v1_idx, v2_idx in loop:
+                    if v1_idx < len(self.vertices) and v2_idx < len(self.vertices):
+                        v1 = self.vertices[v1_idx]
+                        v2 = self.vertices[v2_idx]
+                        glVertex3f(v1[0], v1[1], v1[2])
+                        glVertex3f(v2[0], v2[1], v2[2])
+        glEnd()
+    
     def _draw_coordinate_system(self):
         """Draw coordinate system at lower front corner"""
         axis_origin = np.array([
@@ -964,6 +1673,43 @@ class OBJPlaneVisualizer:
         glColor3f(0.0, 0.0, 0.8)
         glVertex3f(axis_origin[0], axis_origin[1], axis_origin[2])
         glVertex3f(axis_origin[0], axis_origin[1], axis_origin[2] + axis_length)
+        glEnd()
+    
+    def _draw_open_edges(self):
+        """Draw open/boundary edges in the mesh"""
+        if len(self.open_edges) == 0 or len(self.vertices) == 0:
+            return
+        
+        glLineWidth(3.0)
+        glColor3f(1.0, 0.0, 1.0)  # Magenta color for open edges
+        
+        glBegin(GL_LINES)
+        for v1_idx, v2_idx in self.open_edges:
+            if v1_idx < len(self.vertices) and v2_idx < len(self.vertices):
+                v1 = self.vertices[v1_idx]
+                v2 = self.vertices[v2_idx]
+                glVertex3f(v1[0], v1[1], v1[2])
+                glVertex3f(v2[0], v2[1], v2[2])
+        glEnd()
+    
+    def _draw_selected_loops(self):
+        """Draw selected edge loops with highlighted color"""
+        if len(self.selected_loops) == 0 or len(self.vertices) == 0:
+            return
+        
+        glLineWidth(5.0)
+        glColor3f(0.0, 1.0, 1.0)  # Cyan color for selected loops
+        
+        glBegin(GL_LINES)
+        for loop_idx in self.selected_loops:
+            if loop_idx < len(self.edge_loops):
+                loop = self.edge_loops[loop_idx]
+                for v1_idx, v2_idx in loop:
+                    if v1_idx < len(self.vertices) and v2_idx < len(self.vertices):
+                        v1 = self.vertices[v1_idx]
+                        v2 = self.vertices[v2_idx]
+                        glVertex3f(v1[0], v1[1], v1[2])
+                        glVertex3f(v2[0], v2[1], v2[2])
         glEnd()
 
 
@@ -1030,6 +1776,29 @@ class PlaneVisualizerGUI:
         
         ttk.Button(view_frame, text="Reset View / Fit Object", command=self.reset_view).pack(side=tk.LEFT, padx=5)
         ttk.Button(view_frame, text="Delete Vertices in Plane", command=self.delete_vertices).pack(side=tk.LEFT, padx=5)
+        ttk.Button(view_frame, text="Save OBJ", command=self.save_obj).pack(side=tk.LEFT, padx=5)
+        
+        # Selection mode frame
+        selection_mode_frame = ttk.Frame(self.root, padding="10")
+        selection_mode_frame.pack(fill=tk.X)
+        
+        self.selection_mode_var = tk.StringVar(value="Vertices")
+        ttk.Label(selection_mode_frame, text="Selection Mode:").pack(side=tk.LEFT, padx=5)
+        self.selection_mode_button = ttk.Button(
+            selection_mode_frame, 
+            text="Select Vertices", 
+            command=self.toggle_selection_mode
+        )
+        self.selection_mode_button.pack(side=tk.LEFT, padx=5)
+        
+        # Edge loop flattening frame
+        flatten_frame = ttk.LabelFrame(self.root, text="Flatten Selected Loops", padding="10")
+        flatten_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        ttk.Label(flatten_frame, text="Click 'Select Edge Loops' mode, then click on open edges to select loops:").pack(side=tk.LEFT, padx=5)
+        ttk.Button(flatten_frame, text="Flatten X", command=lambda: self.flatten_loops(0)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(flatten_frame, text="Flatten Y", command=lambda: self.flatten_loops(1)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(flatten_frame, text="Flatten Z", command=lambda: self.flatten_loops(2)).pack(side=tk.LEFT, padx=2)
         
         # Plane view buttons frame
         plane_view_frame = ttk.Frame(self.root, padding="10")
@@ -1043,7 +1812,7 @@ class PlaneVisualizerGUI:
         # Instructions
         instructions = ttk.Label(
             self.root,
-            text="Instructions:\n1. Load OBJ file\n2. Open 3D view\n3. Click 3 vertices to define plane\n4. Adjust distance threshold\n5. Click 'Delete Vertices in Plane' to delete all red vertices\n\n3D View Controls:\n• Left-click + drag: Rotate\n• Right-click + drag: Pan\n• Shift + Left-click + drag: Pan\n• Mouse wheel: Zoom\n• Reset View button: Fit object to center",
+            text="Instructions:\n1. Load OBJ file\n2. Open 3D view\n3. Click 'Select Vertices' or 'Select Edge Loops' to choose mode\n4. Click 3 vertices OR click on open edges (magenta) to select loops\n5. Adjust distance threshold\n6. Click 'Delete Vertices in Plane' to delete all red vertices\n7. Use Flatten X/Y/Z to align selected loops\n8. Click 'Save OBJ' when done\n\n3D View Controls:\n• Left-click + drag: Rotate\n• Right-click + drag: Pan\n• Shift + Left-click + drag: Pan\n• Mouse wheel: Zoom\n• Reset View button: Fit object to center",
             justify=tk.LEFT
         )
         instructions.pack(fill=tk.X, padx=10, pady=5)
@@ -1069,9 +1838,14 @@ class PlaneVisualizerGUI:
         if self.visualizer.extents is not None:
             status = f"Vertices: {len(self.visualizer.vertices)}\n"
             status += f"Faces: {len(self.visualizer.faces)}\n"
+            status += f"Open edge loops: {len(self.visualizer.edge_loops)}\n"
+            status += f"Selected loops: {len(self.visualizer.selected_loops)}\n"
+            status += f"Selection mode: {'Edge Loops' if self.visualizer.edge_loop_selection_mode else 'Vertices'}\n"
             status += f"Selected vertices: {len(self.visualizer.selected_vertices)}/3\n"
             
-            if len(self.visualizer.selected_vertices) == 3:
+            if self.visualizer.edge_loop_selection_mode:
+                status += "Click on open edges (magenta) to select loops"
+            elif len(self.visualizer.selected_vertices) == 3:
                 status += f"Vertices within threshold: {len(self.visualizer.vertices_within_threshold)}"
             else:
                 status += "Click 3 vertices in 3D view to define plane"
@@ -1138,6 +1912,22 @@ class PlaneVisualizerGUI:
         self.visualizer.view_xz_flag = True
         self.visualizer.needs_redraw = True
     
+    def toggle_selection_mode(self):
+        """Toggle between vertex selection and edge loop selection modes"""
+        self.visualizer.edge_loop_selection_mode = not self.visualizer.edge_loop_selection_mode
+        
+        print(f"DEBUG: Selection mode toggled to: {'Edge Loops' if self.visualizer.edge_loop_selection_mode else 'Vertices'}")
+        print(f"DEBUG: Open edges: {len(self.visualizer.open_edges)}, Edge loops: {len(self.visualizer.edge_loops)}")
+        
+        if self.visualizer.edge_loop_selection_mode:
+            self.selection_mode_button.config(text="Select Edge Loops (Active)")
+            self.selection_mode_var.set("Edge Loops")
+        else:
+            self.selection_mode_button.config(text="Select Vertices (Active)")
+            self.selection_mode_var.set("Vertices")
+        
+        self.update_status()
+    
     def delete_vertices(self):
         """Delete all vertices within the plane threshold and save to new file"""
         if not self.visualizer.vertices_within_threshold:
@@ -1148,40 +1938,89 @@ class PlaneVisualizerGUI:
             messagebox.showwarning("Warning", "No OBJ file loaded")
             return
         
-        # Count faces that will be deleted
-        vertices_to_delete = set(self.visualizer.vertices_within_threshold)
-        faces_to_delete = sum(1 for face in self.visualizer.faces 
-                             if any(v_idx in vertices_to_delete for v_idx in face['vertices']))
+        # Note: We can't accurately count what will be deleted without running the deletion logic
+        # because we need to check connectivity. So we'll show an estimate.
+        selection_vertices = set(self.visualizer.vertices_within_threshold)
+        
+        # Count faces that are completely within selection (all vertices in selection)
+        faces_completely_in_selection = sum(1 for face in self.visualizer.faces 
+                                           if len(face['vertices']) > 0 and 
+                                           all(v_idx in selection_vertices for v_idx in face['vertices']))
         
         # Confirmation dialog
-        confirm_msg = f"Delete {len(self.visualizer.vertices_within_threshold)} vertices within plane threshold?\n"
-        confirm_msg += f"This will also delete {faces_to_delete} faces that reference them.\n"
-        confirm_msg += f"Remaining: {len(self.visualizer.vertices) - len(self.visualizer.vertices_within_threshold)} vertices"
+        confirm_msg = f"Delete vertices within plane threshold?\n"
+        confirm_msg += f"Selected vertices: {len(self.visualizer.vertices_within_threshold)}\n"
+        confirm_msg += f"Note: Only vertices not connected to outside vertices will be deleted.\n"
+        confirm_msg += f"Faces completely in selection: {faces_completely_in_selection}\n"
+        confirm_msg += f"Only faces completely within selection will be deleted."
         
         if not messagebox.askyesno("Confirm Deletion", confirm_msg):
             return
         
-        # Perform deletion
+        # Perform deletion (no auto-save - user will save manually)
         deleted_verts, deleted_faces, remaining_verts = self.visualizer.delete_selected_vertices()
         
         if deleted_verts is None:
             messagebox.showerror("Error", "Failed to delete vertices")
             return
         
+        # Show deletion results
+        success_msg = f"Deleted: {deleted_verts} vertices, {deleted_faces} faces\n"
+        success_msg += f"Remaining: {remaining_verts} vertices, {len(self.visualizer.faces)} faces\n"
+        success_msg += f"\nClick 'Save OBJ' when ready to save changes."
+        messagebox.showinfo("Deletion Complete", success_msg)
+        
+        # Update status and reload visualization
+        self.update_status()
+        self.visualizer.needs_redraw = True
+    
+    def flatten_loops(self, axis):
+        """Flatten selected loops along specified axis (0=X, 1=Y, 2=Z)"""
+        if len(self.visualizer.selected_loops) == 0:
+            messagebox.showwarning("Warning", "Please select edge loops first.\nUse Shift+Click on open edges to select loops.")
+            return
+        
+        axis_names = ['X', 'Y', 'Z']
+        success, message = self.visualizer.flatten_selected_loops(axis)
+        
+        if success:
+            messagebox.showinfo("Success", message)
+            self.update_status()
+            self.visualizer.needs_redraw = True
+        else:
+            messagebox.showerror("Error", message)
+    
+    def save_obj(self):
+        """Save the current OBJ file"""
+        if len(self.visualizer.vertices) == 0:
+            messagebox.showwarning("Warning", "No OBJ file loaded")
+            return
+        
+        if not self.visualizer.obj_path:
+            messagebox.showwarning("Warning", "No OBJ file loaded")
+            return
+        
+        # Validate geometry before saving
+        is_valid, error_msg = self.visualizer.validate_geometry()
+        if not is_valid:
+            response = messagebox.askyesno(
+                "Geometry Validation Warning",
+                f"Geometry validation found issues:\n{error_msg}\n\nDo you want to save anyway?"
+            )
+            if not response:
+                return
+        
         # Ask for output file location
         root = tk.Tk()
         root.withdraw()
         
         # Suggest output filename
-        if self.visualizer.obj_path:
-            base_name = os.path.splitext(os.path.basename(self.visualizer.obj_path))[0]
-            dir_name = os.path.dirname(self.visualizer.obj_path)
-            default_name = os.path.join(dir_name, f"{base_name}_edited.obj")
-        else:
-            default_name = "edited.obj"
+        base_name = os.path.splitext(os.path.basename(self.visualizer.obj_path))[0]
+        dir_name = os.path.dirname(self.visualizer.obj_path)
+        default_name = os.path.join(dir_name, f"{base_name}_edited.obj")
         
         output_path = filedialog.asksaveasfilename(
-            title="Save edited OBJ file",
+            title="Save OBJ file",
             defaultextension=".obj",
             filetypes=[("OBJ files", "*.obj"), ("All files", "*.*")],
             initialfile=os.path.basename(default_name),
@@ -1191,25 +2030,13 @@ class PlaneVisualizerGUI:
         root.destroy()
         
         if not output_path:
-            # User cancelled - restore vertices (we already deleted them, so reload file)
-            if self.visualizer.obj_path:
-                self.visualizer.parse_obj_file()
-                self.update_status()
             return
         
-        # Write the edited OBJ file
+        # Write the OBJ file
         if self.visualizer.write_obj_file(output_path):
-            success_msg = f"Successfully saved edited OBJ file!\n\n"
-            success_msg += f"Deleted: {deleted_verts} vertices, {deleted_faces} faces\n"
-            success_msg += f"Remaining: {remaining_verts} vertices, {len(self.visualizer.faces)} faces\n"
-            success_msg += f"Saved to: {os.path.basename(output_path)}"
-            messagebox.showinfo("Success", success_msg)
-            
-            # Update status and reload visualization
-            self.update_status()
-            self.visualizer.needs_redraw = True
+            messagebox.showinfo("Success", f"Successfully saved OBJ file to:\n{os.path.basename(output_path)}")
         else:
-            messagebox.showerror("Error", "Failed to save edited OBJ file")
+            messagebox.showerror("Error", "Failed to save OBJ file")
     
     def open_3d_view(self):
         """Open 3D visualization window"""
