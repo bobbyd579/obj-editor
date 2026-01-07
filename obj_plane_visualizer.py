@@ -82,6 +82,14 @@ class OBJPlaneVisualizer:
         self.open_edges = []  # List of open edges: [(v1, v2), ...]
         self.show_open_edges = True  # Flag to show/hide open edges
         
+        # Batch processing state
+        self.has_unsaved_changes = False  # Flag to track if current file has been modified
+        self.original_vertices = None  # Store original vertices for comparison
+        self.batch_mode = False  # Whether batch mode is active
+        self.current_file_index = -1  # Index of currently selected file in batch list
+        self.batch_file_list = []  # List of full paths to OBJ files found
+        self.close_window_flag = False  # Flag to signal OpenGL window to close
+        
     def select_obj_file(self):
         """Use tkinter to select OBJ file"""
         root = tk.Tk()
@@ -98,6 +106,28 @@ class OBJPlaneVisualizer:
             self.obj_path = file_path
             return True
         return False
+    
+    def mark_as_changed(self):
+        """Mark the current file as having unsaved changes"""
+        self.has_unsaved_changes = True
+    
+    def reset_change_tracking(self):
+        """Reset change tracking and store original vertices"""
+        self.has_unsaved_changes = False
+        if len(self.vertices) > 0:
+            self.original_vertices = self.vertices.copy()
+        else:
+            self.original_vertices = None
+    
+    def close_opengl_window(self):
+        """Signal the OpenGL window to close"""
+        self.close_window_flag = True
+        if self.opengl_window is not None:
+            try:
+                import glfw
+                glfw.set_window_should_close(self.opengl_window, True)
+            except:
+                pass
     
     def parse_obj_file(self):
         """Parse OBJ file to extract vertices, faces, texture coordinates, and normals"""
@@ -198,6 +228,8 @@ class OBJPlaneVisualizer:
             self.open_edges = self.detect_open_edges()
             self.edge_loops = self.find_edge_loops()
             self.selected_loops = set()
+            # Reset change tracking after successful parse
+            self.reset_change_tracking()
             return True
             
         except Exception as e:
@@ -628,6 +660,9 @@ class OBJPlaneVisualizer:
         
         self.needs_redraw = True
         
+        # Mark as changed
+        self.mark_as_changed()
+        
         return True, f"Flattened {vertices_modified} vertices along {axis_names[axis]} axis to {min_value:.6f}"
     
     def validate_geometry(self):
@@ -835,6 +870,9 @@ class OBJPlaneVisualizer:
         self.plane_equation = None
         self.vertex_distances = None
         self.vertices_within_threshold = set()
+        
+        # Mark as changed
+        self.mark_as_changed()
         
         return deleted_vertex_count, deleted_face_count, remaining_vertex_count
     
@@ -1216,8 +1254,13 @@ class OBJPlaneVisualizer:
         glfw.swap_interval(1)
         
         # Main render loop - simplified for better performance
-        while not glfw.window_should_close(window):
+        while not glfw.window_should_close(window) and not self.close_window_flag:
             glfw.poll_events()
+            
+            # Check for close window flag
+            if self.close_window_flag:
+                glfw.set_window_should_close(window, True)
+                break
             
             # Check for reset view flag
             if self.reset_view_flag:
@@ -1569,6 +1612,7 @@ class OBJPlaneVisualizer:
         
         glfw.terminate()
         self.opengl_window = None
+        self.close_window_flag = False  # Reset flag after window closes
     
     def _draw_plane(self):
         """Draw the plane as a semi-transparent surface"""
@@ -1722,12 +1766,39 @@ class PlaneVisualizerGUI:
         self.visualizer.gui = self  # Reference to GUI for updates
         self.root = tk.Tk()
         self.root.title("OBJ Plane Distance Visualizer")
-        self.root.geometry("450x500")
+        self.root.geometry("800x600")
         
         # Store initial size for restoration if needed
         self.initial_geometry = "400x350"
         
+        # Batch processing UI elements (will be created in setup_ui)
+        self.batch_folder_path = None
+        self.file_listbox = None
+        self.file_list_scrollbar = None
+        
         self.setup_ui()
+    
+    def scan_folder_for_obj_files(self, folder_path):
+        """Recursively scan folder and subfolders for OBJ files
+        
+        Args:
+            folder_path: Root folder path to scan
+            
+        Returns:
+            List of full paths to OBJ files found, sorted
+        """
+        obj_files = []
+        try:
+            for root, dirs, files in os.walk(folder_path):
+                for file in files:
+                    if file.lower().endswith('.obj'):
+                        full_path = os.path.join(root, file)
+                        obj_files.append(full_path)
+            # Sort for consistent ordering
+            obj_files.sort()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to scan folder: {str(e)}")
+        return obj_files
     
     def setup_ui(self):
         """Setup the GUI"""
@@ -1776,7 +1847,7 @@ class PlaneVisualizerGUI:
         
         ttk.Button(view_frame, text="Reset View / Fit Object", command=self.reset_view).pack(side=tk.LEFT, padx=5)
         ttk.Button(view_frame, text="Delete Vertices in Plane", command=self.delete_vertices).pack(side=tk.LEFT, padx=5)
-        ttk.Button(view_frame, text="Save OBJ", command=self.save_obj).pack(side=tk.LEFT, padx=5)
+        ttk.Button(view_frame, text="Save OBJ", command=self.save_obj_wrapper).pack(side=tk.LEFT, padx=5)
         
         # Selection mode frame
         selection_mode_frame = ttk.Frame(self.root, padding="10")
@@ -1808,6 +1879,39 @@ class PlaneVisualizerGUI:
         ttk.Button(plane_view_frame, text="XY (Top)", command=self.set_xy_view).pack(side=tk.LEFT, padx=2)
         ttk.Button(plane_view_frame, text="YZ (Front)", command=self.set_yz_view).pack(side=tk.LEFT, padx=2)
         ttk.Button(plane_view_frame, text="XZ (Side)", command=self.set_xz_view).pack(side=tk.LEFT, padx=2)
+        
+        # Batch processing frame
+        batch_frame = ttk.LabelFrame(self.root, text="Batch Processing", padding="10")
+        batch_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        # Folder selection
+        folder_frame = ttk.Frame(batch_frame)
+        folder_frame.pack(fill=tk.X, pady=5)
+        ttk.Button(folder_frame, text="Select Folder", command=self.select_batch_folder).pack(side=tk.LEFT, padx=5)
+        self.batch_folder_label = ttk.Label(folder_frame, text="No folder selected", foreground="gray")
+        self.batch_folder_label.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        
+        # File list with scrollbar
+        list_frame = ttk.Frame(batch_frame)
+        list_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        self.file_list_scrollbar = ttk.Scrollbar(list_frame)
+        self.file_list_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        self.file_listbox = tk.Listbox(list_frame, yscrollcommand=self.file_list_scrollbar.set, height=8)
+        self.file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.file_list_scrollbar.config(command=self.file_listbox.yview)
+        
+        # Bind selection events
+        # Arrow keys work automatically with listbox - <<ListboxSelect>> will fire
+        self.file_listbox.bind('<<ListboxSelect>>', self.on_file_selected)
+        self.file_listbox.bind('<Return>', self.on_file_enter)
+        # Bind focus events to ensure listbox can receive keyboard input
+        self.file_listbox.bind('<Button-1>', lambda e: self.file_listbox.focus_set())
+        
+        # File count label
+        self.file_count_label = ttk.Label(batch_frame, text="0 files found")
+        self.file_count_label.pack(pady=2)
         
         # Instructions
         instructions = ttk.Label(
@@ -1874,6 +1978,141 @@ class PlaneVisualizerGUI:
         self.visualizer.vertices_within_threshold = set()
         self.visualizer.needs_redraw = True
         self.update_status()
+    
+    def select_batch_folder(self):
+        """Open folder dialog to select folder for batch processing"""
+        folder_path = filedialog.askdirectory(title="Select Folder with OBJ Files")
+        if not folder_path:
+            return
+        
+        self.batch_folder_path = folder_path
+        self.batch_folder_label.config(text=os.path.basename(folder_path), foreground="black")
+        
+        # Scan for OBJ files
+        obj_files = self.scan_folder_for_obj_files(folder_path)
+        self.visualizer.batch_file_list = obj_files
+        self.visualizer.batch_mode = len(obj_files) > 0
+        
+        # Update file listbox
+        self.file_listbox.delete(0, tk.END)
+        if len(obj_files) > 0:
+            # Show relative paths from selected folder
+            for file_path in obj_files:
+                rel_path = os.path.relpath(file_path, folder_path)
+                self.file_listbox.insert(tk.END, rel_path)
+            
+            # Update file count
+            self.file_count_label.config(text=f"{len(obj_files)} files found")
+            # Set focus to listbox for keyboard navigation
+            self.file_listbox.focus_set()
+        else:
+            self.file_count_label.config(text="0 files found")
+            messagebox.showinfo("Info", "No OBJ files found in selected folder")
+    
+    def on_file_selected(self, event=None):
+        """Handle file selection from listbox"""
+        if not self.file_listbox.curselection():
+            return
+        
+        selected_indices = self.file_listbox.curselection()
+        if not selected_indices:
+            return
+        
+        file_index = selected_indices[0]
+        self.check_and_switch_file(file_index)
+    
+    
+    def on_file_enter(self, event=None):
+        """Handle Enter key to load selected file"""
+        self.on_file_selected(event)
+        return "break"
+    
+    def check_and_switch_file(self, new_index):
+        """Check for unsaved changes before switching files"""
+        if new_index < 0 or new_index >= len(self.visualizer.batch_file_list):
+            return
+        
+        # If switching to the same file, do nothing
+        if new_index == self.visualizer.current_file_index:
+            return
+        
+        # Check for unsaved changes
+        if self.visualizer.has_unsaved_changes:
+            response = messagebox.askyesnocancel(
+                "Unsaved Changes",
+                "The current file has unsaved changes.\n\n"
+                "Yes: Save changes and switch\n"
+                "No: Discard changes and switch\n"
+                "Cancel: Stay on current file"
+            )
+            
+            if response is None:  # Cancel
+                # Restore previous selection
+                if self.visualizer.current_file_index >= 0:
+                    self.file_listbox.selection_clear(0, tk.END)
+                    self.file_listbox.selection_set(self.visualizer.current_file_index)
+                    self.file_listbox.activate(self.visualizer.current_file_index)
+                    self.file_listbox.see(self.visualizer.current_file_index)
+                    self.file_listbox.focus_set()
+                return
+            elif response is True:  # Save
+                if not self.save_obj(use_edit_prefix=True):
+                    # Save was cancelled or failed, don't switch
+                    if self.visualizer.current_file_index >= 0:
+                        self.file_listbox.selection_clear(0, tk.END)
+                        self.file_listbox.selection_set(self.visualizer.current_file_index)
+                        self.file_listbox.activate(self.visualizer.current_file_index)
+                        self.file_listbox.see(self.visualizer.current_file_index)
+                        self.file_listbox.focus_set()
+                    return
+        
+        # Proceed to switch file
+        self.navigate_to_file(new_index)
+    
+    def navigate_to_file(self, file_index):
+        """Load and display the selected file"""
+        if file_index < 0 or file_index >= len(self.visualizer.batch_file_list):
+            return
+        
+        file_path = self.visualizer.batch_file_list[file_index]
+        
+        # Close current OpenGL window if open
+        if self.visualizer.opengl_window is not None:
+            self.visualizer.close_opengl_window()
+            # Wait a bit for window to close
+            self.root.update()
+            time.sleep(0.1)
+        
+        # Load new file
+        self.visualizer.obj_path = file_path
+        self.visualizer.current_file_index = file_index
+        
+        # Update file label
+        self.file_label.config(text=os.path.basename(file_path), foreground="black")
+        
+        # Parse the file
+        if not self.visualizer.parse_obj_file():
+            messagebox.showerror("Error", f"Failed to parse OBJ file:\n{file_path}")
+            return
+        
+        # Reset to "Select Vertices" mode
+        self.visualizer.edge_loop_selection_mode = False
+        self.selection_mode_button.config(text="Select Vertices (Active)")
+        self.selection_mode_var.set("Vertices")
+        
+        # Update status
+        self.update_status()
+        
+        # Highlight current file in list and ensure it stays highlighted
+        self.file_listbox.selection_clear(0, tk.END)
+        self.file_listbox.selection_set(file_index)
+        self.file_listbox.see(file_index)
+        self.file_listbox.activate(file_index)  # Set active item
+        # Set focus to listbox so arrow keys work
+        self.file_listbox.focus_set()
+        
+        # Auto-open visualizer
+        self.open_3d_view()
     
     def reset_view(self):
         """Reset camera view to fit object"""
@@ -1942,21 +2181,6 @@ class PlaneVisualizerGUI:
         # because we need to check connectivity. So we'll show an estimate.
         selection_vertices = set(self.visualizer.vertices_within_threshold)
         
-        # Count faces that are completely within selection (all vertices in selection)
-        faces_completely_in_selection = sum(1 for face in self.visualizer.faces 
-                                           if len(face['vertices']) > 0 and 
-                                           all(v_idx in selection_vertices for v_idx in face['vertices']))
-        
-        # Confirmation dialog
-        confirm_msg = f"Delete vertices within plane threshold?\n"
-        confirm_msg += f"Selected vertices: {len(self.visualizer.vertices_within_threshold)}\n"
-        confirm_msg += f"Note: Only vertices not connected to outside vertices will be deleted.\n"
-        confirm_msg += f"Faces completely in selection: {faces_completely_in_selection}\n"
-        confirm_msg += f"Only faces completely within selection will be deleted."
-        
-        if not messagebox.askyesno("Confirm Deletion", confirm_msg):
-            return
-        
         # Perform deletion (no auto-save - user will save manually)
         deleted_verts, deleted_faces, remaining_verts = self.visualizer.delete_selected_vertices()
         
@@ -1964,15 +2188,16 @@ class PlaneVisualizerGUI:
             messagebox.showerror("Error", "Failed to delete vertices")
             return
         
-        # Show deletion results
-        success_msg = f"Deleted: {deleted_verts} vertices, {deleted_faces} faces\n"
-        success_msg += f"Remaining: {remaining_verts} vertices, {len(self.visualizer.faces)} faces\n"
-        success_msg += f"\nClick 'Save OBJ' when ready to save changes."
-        messagebox.showinfo("Deletion Complete", success_msg)
-        
         # Update status and reload visualization
         self.update_status()
         self.visualizer.needs_redraw = True
+        
+        # Automatically switch to "Select Edge Loops" mode
+        if not self.visualizer.edge_loop_selection_mode:
+            self.visualizer.edge_loop_selection_mode = True
+            self.selection_mode_button.config(text="Select Edge Loops (Active)")
+            self.selection_mode_var.set("Edge Loops")
+            self.update_status()
     
     def flatten_loops(self, axis):
         """Flatten selected loops along specified axis (0=X, 1=Y, 2=Z)"""
@@ -1990,15 +2215,24 @@ class PlaneVisualizerGUI:
         else:
             messagebox.showerror("Error", message)
     
-    def save_obj(self):
-        """Save the current OBJ file"""
+    def save_obj_wrapper(self):
+        """Wrapper for save button that checks batch mode"""
+        use_edit_prefix = self.visualizer.batch_mode and self.visualizer.current_file_index >= 0
+        self.save_obj(use_edit_prefix=use_edit_prefix)
+    
+    def save_obj(self, use_edit_prefix=False):
+        """Save the current OBJ file
+        
+        Args:
+            use_edit_prefix: If True, save with "_edit" prefix in same directory as original
+        """
         if len(self.visualizer.vertices) == 0:
             messagebox.showwarning("Warning", "No OBJ file loaded")
-            return
+            return False
         
         if not self.visualizer.obj_path:
             messagebox.showwarning("Warning", "No OBJ file loaded")
-            return
+            return False
         
         # Validate geometry before saving
         is_valid, error_msg = self.visualizer.validate_geometry()
@@ -2008,35 +2242,47 @@ class PlaneVisualizerGUI:
                 f"Geometry validation found issues:\n{error_msg}\n\nDo you want to save anyway?"
             )
             if not response:
-                return
+                return False
         
-        # Ask for output file location
-        root = tk.Tk()
-        root.withdraw()
-        
-        # Suggest output filename
-        base_name = os.path.splitext(os.path.basename(self.visualizer.obj_path))[0]
-        dir_name = os.path.dirname(self.visualizer.obj_path)
-        default_name = os.path.join(dir_name, f"{base_name}_edited.obj")
-        
-        output_path = filedialog.asksaveasfilename(
-            title="Save OBJ file",
-            defaultextension=".obj",
-            filetypes=[("OBJ files", "*.obj"), ("All files", "*.*")],
-            initialfile=os.path.basename(default_name),
-            initialdir=os.path.dirname(default_name) if os.path.dirname(default_name) else "."
-        )
-        
-        root.destroy()
-        
-        if not output_path:
-            return
+        # Determine output path
+        if use_edit_prefix:
+            # Save with "_edit" prefix in same directory as original
+            base_name = os.path.splitext(os.path.basename(self.visualizer.obj_path))[0]
+            dir_name = os.path.dirname(self.visualizer.obj_path)
+            output_path = os.path.join(dir_name, f"{base_name}_edit.obj")
+        else:
+            # Ask for output file location
+            root = tk.Tk()
+            root.withdraw()
+            
+            # Suggest output filename
+            base_name = os.path.splitext(os.path.basename(self.visualizer.obj_path))[0]
+            dir_name = os.path.dirname(self.visualizer.obj_path)
+            default_name = os.path.join(dir_name, f"{base_name}_edited.obj")
+            
+            output_path = filedialog.asksaveasfilename(
+                title="Save OBJ file",
+                defaultextension=".obj",
+                filetypes=[("OBJ files", "*.obj"), ("All files", "*.*")],
+                initialfile=os.path.basename(default_name),
+                initialdir=os.path.dirname(default_name) if os.path.dirname(default_name) else "."
+            )
+            
+            root.destroy()
+            
+            if not output_path:
+                return False
         
         # Write the OBJ file
         if self.visualizer.write_obj_file(output_path):
-            messagebox.showinfo("Success", f"Successfully saved OBJ file to:\n{os.path.basename(output_path)}")
+            # Reset change tracking after successful save
+            self.visualizer.reset_change_tracking()
+            if not use_edit_prefix:
+                messagebox.showinfo("Success", f"Successfully saved OBJ file to:\n{os.path.basename(output_path)}")
+            return True
         else:
             messagebox.showerror("Error", "Failed to save OBJ file")
+            return False
     
     def open_3d_view(self):
         """Open 3D visualization window"""
@@ -2071,6 +2317,16 @@ class PlaneVisualizerGUI:
         except:
             w, h = 400, 350
             x_pos = y_pos = None
+        
+        # Close existing window if open
+        if self.visualizer.opengl_window is not None:
+            self.visualizer.close_opengl_window()
+            # Wait a bit for window to close
+            self.root.update()
+            time.sleep(0.2)
+        
+        # Reset close flag before starting new window
+        self.visualizer.close_window_flag = False
         
         # Run OpenGL window in separate thread
         if self.visualizer.opengl_thread is None or not self.visualizer.opengl_thread.is_alive():
