@@ -90,6 +90,12 @@ class OBJPlaneVisualizer:
         self.batch_file_list = []  # List of full paths to OBJ files found
         self.close_window_flag = False  # Flag to signal OpenGL window to close
         
+        # Window position/size memory (persists for session)
+        self.saved_window_x = None  # Saved window X position
+        self.saved_window_y = None  # Saved window Y position
+        self.saved_window_width = 1024  # Default window width
+        self.saved_window_height = 768  # Default window height
+        
     def select_obj_file(self):
         """Use tkinter to select OBJ file"""
         root = tk.Tk()
@@ -1114,14 +1120,36 @@ class OBJPlaneVisualizer:
             messagebox.showerror("Error", "Failed to initialize GLFW")
             return
         
-        window = glfw.create_window(1024, 768, "OBJ Plane Visualizer - Click 3 vertices to define plane", None, None)
+        # Use saved window size and position if available
+        window_width = self.saved_window_width if self.saved_window_width else 1024
+        window_height = self.saved_window_height if self.saved_window_height else 768
+        
+        window = glfw.create_window(window_width, window_height, "OBJ Plane Visualizer - Click 3 vertices to define plane", None, None)
         if not window:
             glfw.terminate()
             messagebox.showerror("Error", "Failed to create GLFW window")
             return
         
+        # Set window position if we have saved position
+        if self.saved_window_x is not None and self.saved_window_y is not None:
+            glfw.set_window_pos(window, self.saved_window_x, self.saved_window_y)
+        
         glfw.make_context_current(window)
         self.opengl_window = window
+        
+        # Set up callbacks to track window position and size changes
+        def window_pos_callback(window, x, y):
+            """Track window position changes"""
+            self.saved_window_x = x
+            self.saved_window_y = y
+        
+        def window_size_callback(window, width, height):
+            """Track window size changes"""
+            self.saved_window_width = width
+            self.saved_window_height = height
+        
+        glfw.set_window_pos_callback(window, window_pos_callback)
+        glfw.set_window_size_callback(window, window_size_callback)
         
         # OpenGL settings
         glEnable(GL_DEPTH_TEST)
@@ -1419,32 +1447,36 @@ class OBJPlaneVisualizer:
             # Process pending edge click for loop selection (after matrices are set up)
             # Only process if it's still pending (wasn't cleared by drag)
             if self.pending_edge_click is not None:
+                # Process the edge click - the mouse button check in cursor_pos_callback already
+                # clears pending clicks if it's a drag, so if we get here it's a real click
                 click_x, click_y, click_width, click_height = self.pending_edge_click
                 self.pending_edge_click = None  # Clear the pending click immediately
                 
                 print(f"DEBUG: Edge click received at ({click_x}, {click_y}), window size: {click_width}x{click_height}")
                 print(f"DEBUG: Open edges count: {len(self.open_edges)}, Edge loops count: {len(self.edge_loops)}")
+                print(f"DEBUG: Currently selected loops: {self.selected_loops}")
                 
                 if len(self.open_edges) == 0:
+                    # No open edges - silently ignore the click
                     print("DEBUG: No open edges detected!")
-                    if self.gui:
-                        try:
-                            self.gui.root.after(0, lambda: messagebox.showwarning("Warning", "No open edges detected in the model. Make sure the OBJ file has been loaded."))
-                        except:
-                            pass
                 else:
                     # Find nearest edge and select its loop
                     nearest_edge = self.find_nearest_edge(click_x, click_y, click_width, click_height)
                     
                     if nearest_edge is not None:
+                        print(f"DEBUG: Found nearest edge: {nearest_edge}")
                         loop_idx = self.get_loop_index_for_edge(nearest_edge)
+                        print(f"DEBUG: Loop index for edge: {loop_idx}")
                         
                         if loop_idx is not None:
                             # Toggle loop selection
                             if loop_idx in self.selected_loops:
+                                print(f"DEBUG: Deselecting loop {loop_idx}")
                                 self.selected_loops.remove(loop_idx)
                             else:
+                                print(f"DEBUG: Selecting loop {loop_idx}")
                                 self.selected_loops.add(loop_idx)
+                            print(f"DEBUG: Selected loops after toggle: {self.selected_loops}")
                             self.needs_redraw = True
                             # Update GUI status
                             if self.gui:
@@ -1470,6 +1502,7 @@ class OBJPlaneVisualizer:
                                 if existing_loop_idx is not None:
                                     # Loop already exists, use it
                                     loop_idx = existing_loop_idx
+                                    print(f"DEBUG: Found existing loop {loop_idx}")
                                 else:
                                     # New loop, add it
                                     loop_idx = len(self.edge_loops)
@@ -1478,9 +1511,12 @@ class OBJPlaneVisualizer:
                                 
                                 # Toggle selection
                                 if loop_idx in self.selected_loops:
+                                    print(f"DEBUG: Deselecting loop {loop_idx}")
                                     self.selected_loops.remove(loop_idx)
                                 else:
+                                    print(f"DEBUG: Selecting loop {loop_idx}")
                                     self.selected_loops.add(loop_idx)
+                                print(f"DEBUG: Selected loops after toggle: {self.selected_loops}")
                                 self.needs_redraw = True
                                 if self.gui:
                                     try:
@@ -1493,6 +1529,7 @@ class OBJPlaneVisualizer:
                                 new_loop_idx = len(self.edge_loops)
                                 self.edge_loops.append([nearest_edge])
                                 self.selected_loops.add(new_loop_idx)
+                                print(f"DEBUG: Selected loops after adding single-edge loop: {self.selected_loops}")
                                 self.needs_redraw = True
                                 if self.gui:
                                     try:
@@ -1500,11 +1537,9 @@ class OBJPlaneVisualizer:
                                     except:
                                         pass
                     else:
-                        if self.gui:
-                            try:
-                                self.gui.root.after(0, lambda: messagebox.showinfo("Info", "No open edge found near the click position. Try clicking closer to the magenta edges."))
-                            except:
-                                pass
+                        # No edge found near click - silently ignore (user might be clicking to rotate/pan)
+                        print(f"DEBUG: No edge found near click position")
+                        pass
             
             # Process pending click for vertex selection (after matrices are set up)
             if self.pending_click is not None:
@@ -2209,7 +2244,7 @@ class PlaneVisualizerGUI:
         success, message = self.visualizer.flatten_selected_loops(axis)
         
         if success:
-            messagebox.showinfo("Success", message)
+            # No confirmation - just update status
             self.update_status()
             self.visualizer.needs_redraw = True
         else:
