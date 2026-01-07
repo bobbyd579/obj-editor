@@ -4,11 +4,27 @@ Loads an OBJ file, displays it in 3D, allows selecting 3 vertices to define a pl
 and highlights vertices within a specified distance from the plane.
 """
 
+# Set DPI awareness BEFORE importing tkinter to prevent scaling issues
+# Use level 1 (Per Monitor DPI Aware) which works better with tkinter
+try:
+    import ctypes
+    # Set to Per Monitor DPI Aware (level 1) for better tkinter compatibility
+    # Level 2 can cause issues with tkinter on high-DPI displays
+    # This must be done before any GUI libraries are imported
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # PROCESS_PER_MONITOR_DPI_AWARE
+    except:
+        # Fallback for older Windows
+        ctypes.windll.user32.SetProcessDPIAware()
+except (ImportError, AttributeError, OSError):
+    pass
+
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import numpy as np
 import os
 import threading
+import time
 
 try:
     import glfw
@@ -48,6 +64,8 @@ class OBJPlaneVisualizer:
         self.opengl_thread = None
         self.needs_redraw = True
         self.gui = None  # Reference to GUI for status updates
+        self.reset_view_flag = False  # Flag to reset camera view
+        self.pending_click = None  # (x, y, width, height) for screen-space selection
         
     def select_obj_file(self):
         """Use tkinter to select OBJ file"""
@@ -196,37 +214,75 @@ class OBJPlaneVisualizer:
         
         return ray_dir
     
-    def find_nearest_vertex(self, mouse_x, mouse_y, camera_pos, ray_dir):
-        """Find nearest vertex to the mouse click"""
+    def find_nearest_vertex_screen_space(self, mouse_x, mouse_y, width, height):
+        """Find nearest vertex to the mouse click using screen-space coordinates"""
         if len(self.vertices) == 0:
             return None
         
-        min_distance = float('inf')
-        nearest_vertex = None
-        selection_tolerance = 0.1  # Fraction of bounding box size
+        # Selection radius in pixels - larger for easier selection
+        selection_radius_pixels = 30.0  # 30 pixel radius
         
-        # Calculate selection radius based on model size
-        model_size = np.max(self.extents)
-        selection_radius = model_size * selection_tolerance
+        min_screen_distance = float('inf')
+        nearest_vertex = None
+        
+        # Get current OpenGL matrices and viewport
+        from OpenGL.GL import glGetDoublev, GL_MODELVIEW_MATRIX, GL_PROJECTION_MATRIX, GL_VIEWPORT
+        from OpenGL.GLU import gluProject
+        import ctypes
+        
+        # Get matrices and viewport
+        modelview = (ctypes.c_double * 16)()
+        projection = (ctypes.c_double * 16)()
+        viewport = (ctypes.c_int * 4)()
+        
+        glGetDoublev(GL_MODELVIEW_MATRIX, modelview)
+        glGetDoublev(GL_PROJECTION_MATRIX, projection)
+        glGetIntegerv(GL_VIEWPORT, viewport)
+        
+        # Convert viewport to tuple for gluProject
+        vp_tuple = tuple(viewport)
+        vp_x, vp_y, vp_width, vp_height = vp_tuple
         
         for i, vertex in enumerate(self.vertices):
-            # Vector from camera to vertex
-            to_vertex = vertex - camera_pos
-            
-            # Project to_vertex onto ray direction
-            projection_length = np.dot(to_vertex, ray_dir)
-            
-            # Closest point on ray to vertex
-            closest_point = camera_pos + ray_dir * projection_length
-            
-            # Distance from vertex to ray
-            distance = np.linalg.norm(vertex - closest_point)
-            
-            # Also check if vertex is in front of camera
-            if projection_length > 0 and distance < selection_radius:
-                if distance < min_distance:
-                    min_distance = distance
-                    nearest_vertex = i
+            # Use gluProject for accurate projection
+            # PyOpenGL's gluProject returns a tuple (winX, winY, winZ) or None on failure
+            try:
+                result = gluProject(
+                    vertex[0],
+                    vertex[1],
+                    vertex[2],
+                    modelview,
+                    projection,
+                    viewport
+                )
+                
+                if result is not None:  # Projection successful
+                    win_x, win_y, win_z = result
+                    
+                    # gluProject returns coordinates in viewport space
+                    # win_x, win_y are in viewport coordinates (Y from bottom)
+                    # mouse_x, mouse_y are in window coordinates (Y from top)
+                    screen_x = win_x
+                    # Convert gluProject Y (bottom origin) to window Y (top origin)
+                    screen_y = height - win_y
+                    
+                    # Check if vertex is in front of camera and in valid depth range
+                    # win_z is in [0, 1] range, where 0 is near plane, 1 is far plane
+                    if 0.0 <= win_z <= 1.0:
+                        # Check if vertex is within window bounds (not just viewport)
+                        if 0 <= screen_x <= width and 0 <= screen_y <= height:
+                            # Calculate distance in screen space (pixels)
+                            dx = screen_x - mouse_x
+                            dy = screen_y - mouse_y
+                            screen_distance = np.sqrt(dx * dx + dy * dy)
+                            
+                            # If within selection radius and closer than previous best
+                            if screen_distance < selection_radius_pixels and screen_distance < min_screen_distance:
+                                min_screen_distance = screen_distance
+                                nearest_vertex = i
+            except:
+                # If gluProject fails, skip this vertex
+                continue
         
         return nearest_vertex
     
@@ -251,11 +307,16 @@ class OBJPlaneVisualizer:
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         glClearColor(1.0, 1.0, 1.0, 1.0)  # White background
         
-        # Camera settings
-        camera_distance = np.max(self.extents) * 2.5
-        camera_x = self.bbox_center[0]
-        camera_y = self.bbox_center[1]
-        camera_z = self.bbox_center[2] + camera_distance
+        # Camera settings - store initial values for reset
+        initial_camera_distance = np.max(self.extents) * 2.5
+        initial_camera_x = self.bbox_center[0]
+        initial_camera_y = self.bbox_center[1]
+        initial_camera_z = self.bbox_center[2] + initial_camera_distance
+        
+        camera_distance = initial_camera_distance
+        camera_x = initial_camera_x
+        camera_y = initial_camera_y
+        camera_z = initial_camera_z
         
         rotation_x = 0.0
         rotation_y = 0.0
@@ -275,92 +336,14 @@ class OBJPlaneVisualizer:
                 mouse_button = button
                 
                 if button == glfw.MOUSE_BUTTON_LEFT:
-                    # Get mouse position
+                    # Get mouse position (window coordinates, top-left origin)
                     xpos, ypos = glfw.get_cursor_pos(window)
                     width, height = glfw.get_framebuffer_size(window)
                     
-                    # Calculate camera position
-                    camera_pos = np.array([camera_x + pan_x, camera_y + pan_y, camera_z])
-                    
-                    # Calculate view direction (toward center)
-                    view_dir = np.array([
-                        self.bbox_center[0] + pan_x - camera_pos[0],
-                        self.bbox_center[1] + pan_y - camera_pos[1],
-                        self.bbox_center[2] - camera_pos[2]
-                    ])
-                    view_dir = view_dir / np.linalg.norm(view_dir)
-                    
-                    # Calculate right and up vectors
-                    right = np.cross(view_dir, np.array([0, 1, 0]))
-                    if np.linalg.norm(right) < 0.1:
-                        right = np.cross(view_dir, np.array([1, 0, 0]))
-                    right = right / np.linalg.norm(right)
-                    up = np.cross(right, view_dir)
-                    up = up / np.linalg.norm(up)
-                    
-                    # Calculate field of view
-                    fov_rad = np.radians(45.0)
-                    aspect = width / height if height > 0 else 1.0
-                    tan_fov = np.tan(fov_rad / 2.0)
-                    
-                    # Convert screen coordinates to normalized device coordinates
-                    x_ndc = (2.0 * xpos / width) - 1.0
-                    y_ndc = 1.0 - (2.0 * ypos / height)
-                    
-                    # Calculate ray direction in camera space
-                    ray_camera_x = x_ndc * tan_fov * aspect
-                    ray_camera_y = y_ndc * tan_fov
-                    
-                    # Transform to world space
-                    ray_dir = view_dir + right * ray_camera_x + up * ray_camera_y
-                    ray_dir = ray_dir / np.linalg.norm(ray_dir)
-                    
-                    nearest = self.find_nearest_vertex(xpos, ypos, camera_pos, ray_dir)
-                    
-                    if nearest is not None:
-                        if len(self.selected_vertices) < 3:
-                            if nearest not in self.selected_vertices:
-                                self.selected_vertices.append(nearest)
-                                
-                                # If we have 3 vertices, calculate plane
-                                if len(self.selected_vertices) == 3:
-                                    p1 = self.vertices[self.selected_vertices[0]]
-                                    p2 = self.vertices[self.selected_vertices[1]]
-                                    p3 = self.vertices[self.selected_vertices[2]]
-                                    
-                                    plane = self.calculate_plane_from_points(p1, p2, p3)
-                                    if plane is not None:
-                                        self.plane_equation = plane
-                                        self.calculate_vertex_distances()
-                                        # Update GUI status (use threading-safe method)
-                                        if self.gui:
-                                            try:
-                                                self.gui.root.after(0, self.gui.update_status)
-                                            except:
-                                                pass
-                                    else:
-                                        # Show warning in a thread-safe way
-                                        if self.gui:
-                                            self.gui.root.after(0, lambda: messagebox.showwarning("Warning", "Selected points are collinear. Please select 3 non-collinear points."))
-                                        self.selected_vertices.pop()
-                                else:
-                                    # Update status when vertex is selected
-                                    if self.gui:
-                                        try:
-                                            self.gui.root.after(0, self.gui.update_status)
-                                        except:
-                                            pass
-                        else:
-                            # Reset selection
-                            self.selected_vertices = [nearest]
-                            self.plane_equation = None
-                            self.vertex_distances = None
-                            self.vertices_within_threshold = set()
-                            if self.gui:
-                                try:
-                                    self.gui.root.after(0, self.gui.update_status)
-                                except:
-                                    pass
+                    # Store click for processing in render loop (after matrices are set up)
+                    # Note: glfw.get_cursor_pos gives window coordinates (top-left origin)
+                    # We'll convert to viewport coordinates in the selection function
+                    self.pending_click = (xpos, ypos, width, height)
             
             elif action == glfw.RELEASE:
                 mouse_down = False
@@ -372,11 +355,15 @@ class OBJPlaneVisualizer:
                 dx = xpos - last_x
                 dy = ypos - last_y
                 
-                if mouse_button == glfw.MOUSE_BUTTON_LEFT and glfw.get_key(window, glfw.KEY_LEFT_SHIFT) == glfw.PRESS:
-                    # Pan
-                    pan_x += dx * 0.01
-                    pan_y -= dy * 0.01
-                else:
+                # Right mouse button or Shift+Left = Pan
+                if mouse_button == glfw.MOUSE_BUTTON_RIGHT or \
+                   (mouse_button == glfw.MOUSE_BUTTON_LEFT and glfw.get_key(window, glfw.KEY_LEFT_SHIFT) == glfw.PRESS):
+                    # Pan - calculate pan speed based on zoom level and model size
+                    model_size = np.max(self.extents) if self.extents is not None else 1.0
+                    pan_speed = (model_size * 0.001) * zoom  # Pan more when zoomed in, scale with model size
+                    pan_x += dx * pan_speed
+                    pan_y -= dy * pan_speed
+                elif mouse_button == glfw.MOUSE_BUTTON_LEFT:
                     # Rotate
                     rotation_y += dx * 0.5
                     rotation_x += dy * 0.5
@@ -385,16 +372,37 @@ class OBJPlaneVisualizer:
         
         def scroll_callback(window, xoffset, yoffset):
             nonlocal zoom
-            zoom += yoffset * 0.1
-            zoom = max(0.1, min(5.0, zoom))
+            # Zoom with mouse wheel - exponential zoom for better control
+            # Use yoffset directly (positive = zoom in, negative = zoom out)
+            if yoffset != 0:
+                zoom_factor = 1.15 if yoffset > 0 else 1.0 / 1.15
+                zoom *= zoom_factor
+                zoom = max(0.05, min(20.0, zoom))  # Wider zoom range
+                self.needs_redraw = True
         
         glfw.set_mouse_button_callback(window, mouse_button_callback)
         glfw.set_cursor_pos_callback(window, cursor_pos_callback)
         glfw.set_scroll_callback(window, scroll_callback)
         
-        # Main render loop
+        # Enable vsync for better performance
+        glfw.swap_interval(1)
+        
+        # Main render loop - simplified for better performance
         while not glfw.window_should_close(window):
             glfw.poll_events()
+            
+            # Check for reset view flag
+            if self.reset_view_flag:
+                rotation_x = 0.0
+                rotation_y = 0.0
+                zoom = 1.0
+                pan_x = 0.0
+                pan_y = 0.0
+                camera_distance = initial_camera_distance
+                camera_x = initial_camera_x
+                camera_y = initial_camera_y
+                camera_z = initial_camera_z
+                self.reset_view_flag = False
             
             # Clear
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
@@ -412,10 +420,31 @@ class OBJPlaneVisualizer:
             glMatrixMode(GL_MODELVIEW)
             glLoadIdentity()
             
-            # Camera position
+            # Camera position - apply zoom by adjusting distance from center
             current_distance = camera_distance / zoom
+            # Calculate direction from center to original camera position
+            dir_x = camera_x - self.bbox_center[0]
+            dir_y = camera_y - self.bbox_center[1]
+            dir_z = camera_z - self.bbox_center[2]
+            dir_length = np.sqrt(dir_x*dir_x + dir_y*dir_y + dir_z*dir_z)
+            
+            if dir_length > 0.001:  # Avoid division by zero
+                # Normalize and scale by zoomed distance
+                dir_x = dir_x / dir_length * current_distance
+                dir_y = dir_y / dir_length * current_distance
+                dir_z = dir_z / dir_length * current_distance
+                
+                zoomed_camera_x = self.bbox_center[0] + dir_x
+                zoomed_camera_y = self.bbox_center[1] + dir_y
+                zoomed_camera_z = self.bbox_center[2] + dir_z
+            else:
+                # Fallback to original position
+                zoomed_camera_x = camera_x
+                zoomed_camera_y = camera_y
+                zoomed_camera_z = camera_z
+            
             gluLookAt(
-                camera_x + pan_x, camera_y + pan_y, camera_z,
+                zoomed_camera_x + pan_x, zoomed_camera_y + pan_y, zoomed_camera_z,
                 self.bbox_center[0] + pan_x, self.bbox_center[1] + pan_y, self.bbox_center[2],
                 0, 1, 0
             )
@@ -426,17 +455,73 @@ class OBJPlaneVisualizer:
             glRotatef(rotation_y, 0, 1, 0)
             glTranslatef(-self.bbox_center[0], -self.bbox_center[1], -self.bbox_center[2])
             
-            # Draw vertices
+            # Process pending click for vertex selection (after matrices are set up)
+            if self.pending_click is not None:
+                click_x, click_y, click_width, click_height = self.pending_click
+                self.pending_click = None  # Clear the pending click
+                
+                # Now that matrices are set up, do screen-space selection
+                nearest = self.find_nearest_vertex_screen_space(click_x, click_y, click_width, click_height)
+                
+                if nearest is not None:
+                    if len(self.selected_vertices) < 3:
+                        if nearest not in self.selected_vertices:
+                            self.selected_vertices.append(nearest)
+                            
+                            # If we have 3 vertices, calculate plane
+                            if len(self.selected_vertices) == 3:
+                                p1 = self.vertices[self.selected_vertices[0]]
+                                p2 = self.vertices[self.selected_vertices[1]]
+                                p3 = self.vertices[self.selected_vertices[2]]
+                                
+                                plane = self.calculate_plane_from_points(p1, p2, p3)
+                                if plane is not None:
+                                    self.plane_equation = plane
+                                    self.calculate_vertex_distances()
+                                    # Update GUI status (use threading-safe method)
+                                    if self.gui:
+                                        try:
+                                            self.gui.root.after(0, self.gui.update_status)
+                                        except:
+                                            pass
+                                else:
+                                    # Show warning in a thread-safe way
+                                    if self.gui:
+                                        self.gui.root.after(0, lambda: messagebox.showwarning("Warning", "Selected points are collinear. Please select 3 non-collinear points."))
+                                    self.selected_vertices.pop()
+                            else:
+                                # Update status when vertex is selected
+                                if self.gui:
+                                    try:
+                                        self.gui.root.after(0, self.gui.update_status)
+                                    except:
+                                        pass
+                    else:
+                        # Reset selection
+                        self.selected_vertices = [nearest]
+                        self.plane_equation = None
+                        self.vertex_distances = None
+                        self.vertices_within_threshold = set()
+                        if self.gui:
+                            try:
+                                self.gui.root.after(0, self.gui.update_status)
+                            except:
+                                pass
+            
+            # Draw vertices - optimized single pass
             if len(self.vertices) > 0:
                 glPointSize(3.0)
                 glBegin(GL_POINTS)
                 
+                selected_set = set(self.selected_vertices)
+                threshold_set = self.vertices_within_threshold
+                
                 for i, vertex in enumerate(self.vertices):
                     # Color based on selection and distance
-                    if i in self.selected_vertices:
-                        # Selected vertices - yellow
+                    if i in selected_set:
+                        # Selected vertices - yellow (will be redrawn larger below)
                         glColor3f(1.0, 1.0, 0.0)
-                    elif i in self.vertices_within_threshold:
+                    elif i in threshold_set:
                         # Vertices within threshold - red
                         glColor3f(1.0, 0.0, 0.0)
                     else:
@@ -447,7 +532,7 @@ class OBJPlaneVisualizer:
                 
                 glEnd()
             
-            # Draw selected vertices with larger markers
+            # Draw selected vertices with larger markers on top
             if len(self.selected_vertices) > 0:
                 glPointSize(8.0)
                 glColor3f(1.0, 1.0, 0.0)  # Yellow
@@ -564,7 +649,10 @@ class PlaneVisualizerGUI:
         self.visualizer.gui = self  # Reference to GUI for updates
         self.root = tk.Tk()
         self.root.title("OBJ Plane Distance Visualizer")
-        self.root.geometry("400x350")
+        self.root.geometry("450x500")
+        
+        # Store initial size for restoration if needed
+        self.initial_geometry = "400x350"
         
         self.setup_ui()
     
@@ -609,10 +697,16 @@ class PlaneVisualizerGUI:
         ttk.Button(button_frame, text="Open 3D View", command=self.open_3d_view).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Reset Selection", command=self.reset_selection).pack(side=tk.RIGHT, padx=5)
         
+        # View controls frame
+        view_frame = ttk.Frame(self.root, padding="10")
+        view_frame.pack(fill=tk.X)
+        
+        ttk.Button(view_frame, text="Reset View / Fit Object", command=self.reset_view).pack(side=tk.LEFT, padx=5)
+        
         # Instructions
         instructions = ttk.Label(
             self.root,
-            text="Instructions:\n1. Load OBJ file\n2. Open 3D view\n3. Click 3 vertices to define plane\n4. Adjust distance threshold",
+            text="Instructions:\n1. Load OBJ file\n2. Open 3D view\n3. Click 3 vertices to define plane\n4. Adjust distance threshold\n\n3D View Controls:\n• Left-click + drag: Rotate\n• Right-click + drag: Pan\n• Shift + Left-click + drag: Pan\n• Mouse wheel: Zoom\n• Reset View button: Fit object to center",
             justify=tk.LEFT
         )
         instructions.pack(fill=tk.X, padx=10, pady=5)
@@ -670,6 +764,16 @@ class PlaneVisualizerGUI:
         self.visualizer.needs_redraw = True
         self.update_status()
     
+    def reset_view(self):
+        """Reset camera view to fit object"""
+        if self.visualizer.opengl_window is None:
+            messagebox.showinfo("Info", "Please open the 3D view first")
+            return
+        
+        # Set flag to reset view in OpenGL thread
+        self.visualizer.reset_view_flag = True
+        self.visualizer.needs_redraw = True
+    
     def open_3d_view(self):
         """Open 3D visualization window"""
         if len(self.visualizer.vertices) == 0:
@@ -680,10 +784,70 @@ class PlaneVisualizerGUI:
             messagebox.showerror("Error", "PyOpenGL not available. Please install: pip install PyOpenGL glfw")
             return
         
+        # Get current window size and position in actual pixels before GLFW initializes
+        try:
+            self.root.update_idletasks()
+            # Get actual pixel dimensions (accounts for DPI scaling)
+            w = self.root.winfo_width()
+            h = self.root.winfo_height()
+            x_pos = self.root.winfo_x()
+            y_pos = self.root.winfo_y()
+            
+            # Fallback to geometry string if winfo fails
+            if w <= 1 or h <= 1:
+                current_geometry = self.root.geometry()
+                parts = current_geometry.split('+')
+                size_part = parts[0]
+                if 'x' in size_part:
+                    w, h = map(int, size_part.split('x'))
+                else:
+                    w, h = 400, 350
+                x_pos = int(parts[1]) if len(parts) > 1 else x_pos
+                y_pos = int(parts[2]) if len(parts) > 2 else y_pos
+        except:
+            w, h = 400, 350
+            x_pos = y_pos = None
+        
         # Run OpenGL window in separate thread
         if self.visualizer.opengl_thread is None or not self.visualizer.opengl_thread.is_alive():
             self.visualizer.opengl_thread = threading.Thread(target=self.visualizer.run_opengl_window, daemon=True)
             self.visualizer.opengl_thread.start()
+            
+            # Restore window size after GLFW initializes (multiple attempts)
+            def restore_window_size(attempt=0):
+                try:
+                    self.root.update_idletasks()
+                    
+                    # Force the window to maintain its exact pixel size
+                    if x_pos is not None and y_pos is not None:
+                        restore_geometry = f"{w}x{h}+{x_pos}+{y_pos}"
+                    else:
+                        restore_geometry = f"{w}x{h}"
+                    
+                    # Set geometry multiple times to force it
+                    self.root.geometry(restore_geometry)
+                    self.root.update_idletasks()
+                    self.root.geometry(restore_geometry)  # Set again to force
+                    self.root.update_idletasks()
+                    
+                    # Verify it worked
+                    current_w = self.root.winfo_width()
+                    current_h = self.root.winfo_height()
+                    
+                    # If size changed, try again
+                    if (abs(current_w - w) > 5 or abs(current_h - h) > 5) and attempt < 5:
+                        self.root.after(50, lambda: restore_window_size(attempt + 1))
+                except Exception:
+                    # If restoration fails, try again
+                    if attempt < 5:
+                        self.root.after(50, lambda: restore_window_size(attempt + 1))
+            
+            # Start restoration attempts - more frequent at first
+            self.root.after(10, lambda: restore_window_size(0))
+            self.root.after(50, lambda: restore_window_size(1))
+            self.root.after(100, lambda: restore_window_size(2))
+            self.root.after(200, lambda: restore_window_size(3))
+            self.root.after(500, lambda: restore_window_size(4))
     
     def run(self):
         """Run the GUI"""
