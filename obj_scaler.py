@@ -62,6 +62,12 @@ class OBJScaler:
         self.batch_file_list = []  # List of full paths to OBJ files found
         self.current_file_index = -1  # Index of currently selected file in batch list
         
+        # Window position/size memory (persists for session)
+        self.saved_window_x = None  # Saved window X position
+        self.saved_window_y = None  # Saved window Y position
+        self.saved_window_width = 1024  # Default window width
+        self.saved_window_height = 768  # Default window height
+        
     def select_obj_file(self):
         """Use tkinter to select OBJ file"""
         root = tk.Tk()
@@ -207,14 +213,36 @@ class OBJScaler:
             messagebox.showerror("Error", "Failed to initialize GLFW")
             return
         
+        # Use saved window size and position if available
+        window_width = self.saved_window_width if self.saved_window_width else 1024
+        window_height = self.saved_window_height if self.saved_window_height else 768
+        
         # Create window
-        window = glfw.create_window(1024, 768, "OBJ Model with Bounding Box", None, None)
+        window = glfw.create_window(window_width, window_height, "OBJ Model with Bounding Box", None, None)
         if not window:
             glfw.terminate()
             messagebox.showerror("Error", "Failed to create GLFW window")
             return
         
+        # Set window position if we have saved position
+        if self.saved_window_x is not None and self.saved_window_y is not None:
+            glfw.set_window_pos(window, self.saved_window_x, self.saved_window_y)
+        
         glfw.make_context_current(window)
+        
+        # Set up callbacks to track window position and size changes
+        def window_pos_callback(window, x, y):
+            """Track window position changes"""
+            self.saved_window_x = x
+            self.saved_window_y = y
+        
+        def window_size_callback(window, width, height):
+            """Track window size changes"""
+            self.saved_window_width = width
+            self.saved_window_height = height
+        
+        glfw.set_window_pos_callback(window, window_pos_callback)
+        glfw.set_window_size_callback(window, window_size_callback)
         
         # Update window title with dimensions
         dim_text = f"OBJ Model - BBox: X={self.extents[0]:.2f} Y={self.extents[1]:.2f} Z={self.extents[2]:.2f}"
@@ -670,6 +698,31 @@ class OBJScaler:
         
         return scaled_vertices, uniform_scale
     
+    def rotate_vertices_neg90_deg_x(self, vertices):
+        """Rotate vertices -90 degrees about the X axis.
+        Y becomes -Z, Z becomes Y.
+        Transformation: (x, y, z) -> (x, -z, y)
+        
+        Args:
+            vertices: numpy array of vertices (N x 3)
+            
+        Returns:
+            Rotated vertices (N x 3)
+        """
+        if len(vertices) == 0:
+            return vertices
+        
+        rotated = vertices.copy()
+        # Store original Y and Z values
+        y_orig = rotated[:, 1].copy()
+        z_orig = rotated[:, 2].copy()
+        
+        # Apply rotation: (x, y, z) -> (x, -z, y)
+        rotated[:, 1] = -z_orig  # Y becomes -Z
+        rotated[:, 2] = y_orig  # Z becomes Y
+        
+        return rotated
+    
     def write_scaled_obj(self, scaled_vertices, output_path):
         """Write scaled OBJ file preserving all original data"""
         try:
@@ -881,13 +934,14 @@ class OBJScaler:
             messagebox.showerror("Error", f"Failed to copy MTL file: {str(e)}")
             return False
     
-    def create_scaled_file_with_mtl(self, target_y, scale_name, output_dir):
+    def create_scaled_file_with_mtl(self, target_y, scale_name, output_dir, rotate=False):
         """Create a scaled OBJ file with MTL file (copied from original) pointing to textures.
         
         Args:
             target_y: Target Y dimension in mm
             scale_name: Name for the scale (e.g., "G", "O", "S")
             output_dir: Directory to save the scaled files
+            rotate: If True, rotate -90 degrees about X axis before saving
             
         Returns:
             (success, output_path) tuple
@@ -898,6 +952,10 @@ class OBJScaler:
         # Scale vertices to target Y dimension
         scaled_vertices, scale_factor = self.scale_vertices(target_y=target_y)
         
+        # Rotate -90 degrees about X axis if requested
+        if rotate:
+            scaled_vertices = self.rotate_vertices_neg90_deg_x(scaled_vertices)
+        
         # Create output directory if it doesn't exist
         os.makedirs(output_dir, exist_ok=True)
         
@@ -906,7 +964,7 @@ class OBJScaler:
         output_obj_name = f"{obj_name}_{scale_name}.obj"
         output_obj_path = os.path.join(output_dir, output_obj_name)
         
-        # Write scaled OBJ
+        # Write scaled (and optionally rotated) OBJ
         if not self.write_scaled_obj(scaled_vertices, output_obj_path):
             return False, None
         
@@ -960,7 +1018,7 @@ class ScalingGUI:
         self.scaler = OBJScaler()
         self.root = tk.Tk()
         self.root.title("OBJ Scaler")
-        self.root.geometry("600x700")
+        self.root.geometry("800x900")  # Larger initial size to show all buttons and panes
         
         # Batch processing UI elements
         self.batch_folder_path = None
@@ -1050,6 +1108,13 @@ class ScalingGUI:
         ttk.Button(scale_row2, text="6in (150mm)", command=lambda: self.create_scale('6in')).pack(side=tk.LEFT, padx=2)
         ttk.Button(scale_row2, text="4in (100mm)", command=lambda: self.create_scale('4in')).pack(side=tk.LEFT, padx=2)
         ttk.Button(scale_row2, text="3in (75mm)", command=lambda: self.create_scale('3in')).pack(side=tk.LEFT, padx=2)
+        
+        # Rotation checkbox
+        rotation_frame = ttk.Frame(scales_frame)
+        rotation_frame.pack(fill=tk.X, pady=5)
+        self.rotate_checkbox_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(rotation_frame, text="Rotate -90° about X axis (Y→-Z, Z→Y)", 
+                       variable=self.rotate_checkbox_var).pack(side=tk.LEFT, padx=5)
         
         # Create All button
         ttk.Button(scales_frame, text="Create All Scales", command=self.create_all_scales).pack(pady=5)
@@ -1290,13 +1355,17 @@ class ScalingGUI:
         obj_dir = os.path.dirname(self.scaler.obj_path)
         output_dir = os.path.join(obj_dir, "scaled")
         
+        # Get rotation setting from checkbox
+        rotate = self.rotate_checkbox_var.get()
+        
         # Create scaled file
-        success, output_path = self.scaler.create_scaled_file_with_mtl(target_y, scale_name, output_dir)
+        success, output_path = self.scaler.create_scaled_file_with_mtl(target_y, scale_name, output_dir, rotate=rotate)
         
         if success:
+            rotate_text = " (rotated -90° about X)" if rotate else ""
             messagebox.showinfo("Success", 
                               f"Scaled file created:\n{os.path.basename(output_path)}\n\n"
-                              f"Scale: {scale_name} ({target_y}mm Y dimension)\n"
+                              f"Scale: {scale_name} ({target_y}mm Y dimension){rotate_text}\n"
                               f"Saved to: {output_dir}")
         else:
             messagebox.showerror("Error", f"Failed to create scaled file for {scale_name}")
@@ -1311,19 +1380,23 @@ class ScalingGUI:
         obj_dir = os.path.dirname(self.scaler.obj_path)
         output_dir = os.path.join(obj_dir, "scaled")
         
+        # Get rotation setting from checkbox
+        rotate = self.rotate_checkbox_var.get()
+        
         # Create all scales
         created = []
         failed = []
         
         for scale_name, target_y in self.standard_scales.items():
-            success, output_path = self.scaler.create_scaled_file_with_mtl(target_y, scale_name, output_dir)
+            success, output_path = self.scaler.create_scaled_file_with_mtl(target_y, scale_name, output_dir, rotate=rotate)
             if success:
                 created.append(scale_name)
             else:
                 failed.append(scale_name)
         
         # Show results
-        message = f"Created {len(created)} scaled files:\n"
+        rotate_text = " (rotated -90° about X)" if rotate else ""
+        message = f"Created {len(created)} scaled files{rotate_text}:\n"
         message += ", ".join(created) + "\n\n"
         message += f"Saved to: {output_dir}"
         
