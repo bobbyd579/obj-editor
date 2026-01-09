@@ -4,6 +4,21 @@ Loads an OBJ file, calculates bounding box, displays it visually,
 and allows scaling based on target dimensions.
 """
 
+# Set DPI awareness BEFORE importing tkinter to prevent scaling issues
+# Use level 1 (Per Monitor DPI Aware) which works better with tkinter
+try:
+    import ctypes
+    # Set to Per Monitor DPI Aware (level 1) for better tkinter compatibility
+    # Level 2 can cause issues with tkinter on high-DPI displays
+    # This must be done before any GUI libraries are imported
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # PROCESS_PER_MONITOR_DPI_AWARE
+    except:
+        # Fallback for older Windows
+        ctypes.windll.user32.SetProcessDPIAware()
+except (ImportError, AttributeError, OSError):
+    pass
+
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import numpy as np
@@ -42,6 +57,10 @@ class OBJScaler:
         self.bbox_max = None
         self.bbox_center = None
         self.extents = None
+        
+        # Batch processing state
+        self.batch_file_list = []  # List of full paths to OBJ files found
+        self.current_file_index = -1  # Index of currently selected file in batch list
         
     def select_obj_file(self):
         """Use tkinter to select OBJ file"""
@@ -742,6 +761,198 @@ class OBJScaler:
         except Exception as e:
             messagebox.showwarning("Warning", f"Could not copy MTL/texture files: {str(e)}")
             return False
+    
+    def get_texture_file_from_mtl(self):
+        """Extract texture file path from MTL file.
+        Returns the first texture file found, or None if no texture."""
+        if not self.mtl_path or not os.path.exists(self.mtl_path):
+            return None
+        
+        try:
+            mtl_dir = os.path.dirname(self.mtl_path)
+            with open(self.mtl_path, 'r', encoding='utf-8') as f:
+                mtl_content = f.read()
+                import re
+                texture_patterns = [
+                    r'map_Kd\s+(.+)',
+                    r'map_Ks\s+(.+)',
+                    r'map_Ka\s+(.+)',
+                    r'map_bump\s+(.+)',
+                    r'map_d\s+(.+)',
+                    r'map_Ns\s+(.+)',
+                ]
+                
+                for pattern in texture_patterns:
+                    matches = re.findall(pattern, mtl_content, re.IGNORECASE)
+                    for match in matches:
+                        texture_path = match.strip()
+                        # Handle both absolute and relative paths
+                        if os.path.isabs(texture_path):
+                            full_path = texture_path
+                        else:
+                            full_path = os.path.join(mtl_dir, texture_path)
+                        
+                        if os.path.exists(full_path):
+                            return full_path
+        except Exception:
+            pass
+        
+        return None
+    
+    def copy_mtl_and_update_textures(self, output_mtl_path, output_dir):
+        """Copy MTL file and update texture paths to point to textures in output directory.
+        Also copies all texture files to output directory.
+        
+        Args:
+            output_mtl_path: Path where the new MTL file should be saved
+            output_dir: Directory where textures should be copied
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self.mtl_path or not os.path.exists(self.mtl_path):
+            return True  # No MTL file, nothing to copy
+        
+        try:
+            mtl_dir = os.path.dirname(self.mtl_path)
+            
+            # Read original MTL file
+            with open(self.mtl_path, 'r', encoding='utf-8') as f:
+                mtl_lines = f.readlines()
+            
+            # Find all texture references and copy textures
+            import re
+            # Pattern to match texture map lines: prefix, whitespace, texture path (may have trailing comment)
+            # Capture the texture path (non-whitespace characters, may include path separators)
+            texture_patterns = [
+                (r'(map_Kd)\s+([^\s#]+)', 'map_Kd'),
+                (r'(map_Ks)\s+([^\s#]+)', 'map_Ks'),
+                (r'(map_Ka)\s+([^\s#]+)', 'map_Ka'),
+                (r'(map_bump)\s+([^\s#]+)', 'map_bump'),
+                (r'(map_d)\s+([^\s#]+)', 'map_d'),
+                (r'(map_Ns)\s+([^\s#]+)', 'map_Ns'),
+            ]
+            
+            # Process each line and update texture paths
+            updated_lines = []
+            for line in mtl_lines:
+                updated_line = line
+                
+                # Check each texture pattern
+                for pattern, prefix in texture_patterns:
+                    match = re.search(pattern, line, re.IGNORECASE)
+                    if match:
+                        texture_path = match.group(2).strip()  # Group 2 is the texture path
+                        
+                        # Handle both absolute and relative paths
+                        if os.path.isabs(texture_path):
+                            full_path = texture_path
+                        else:
+                            full_path = os.path.join(mtl_dir, texture_path)
+                        
+                        # Copy texture if it exists
+                        if os.path.exists(full_path):
+                            texture_name = os.path.basename(texture_path)
+                            dest_texture_path = os.path.join(output_dir, texture_name)
+                            
+                            # Copy texture if not already copied
+                            if not os.path.exists(dest_texture_path):
+                                shutil.copy2(full_path, dest_texture_path)
+                            
+                            # Replace the texture path with just the filename
+                            # This preserves the prefix, whitespace, and any trailing content (comments, etc.)
+                            updated_line = re.sub(
+                                pattern,
+                                lambda m: f"{m.group(1)} {texture_name}",
+                                line,
+                                flags=re.IGNORECASE
+                            )
+                            break  # Only replace first match per line
+                
+                updated_lines.append(updated_line)
+            
+            # Write updated MTL file
+            with open(output_mtl_path, 'w', encoding='utf-8') as f:
+                f.writelines(updated_lines)
+            
+            return True
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to copy MTL file: {str(e)}")
+            return False
+    
+    def create_scaled_file_with_mtl(self, target_y, scale_name, output_dir):
+        """Create a scaled OBJ file with MTL file (copied from original) pointing to textures.
+        
+        Args:
+            target_y: Target Y dimension in mm
+            scale_name: Name for the scale (e.g., "G", "O", "S")
+            output_dir: Directory to save the scaled files
+            
+        Returns:
+            (success, output_path) tuple
+        """
+        if self.extents is None:
+            return False, None
+        
+        # Scale vertices to target Y dimension
+        scaled_vertices, scale_factor = self.scale_vertices(target_y=target_y)
+        
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Generate output filename
+        obj_name = os.path.splitext(os.path.basename(self.obj_path))[0]
+        output_obj_name = f"{obj_name}_{scale_name}.obj"
+        output_obj_path = os.path.join(output_dir, output_obj_name)
+        
+        # Write scaled OBJ
+        if not self.write_scaled_obj(scaled_vertices, output_obj_path):
+            return False, None
+        
+        # Copy MTL file and update texture paths
+        output_mtl_name = f"{obj_name}_{scale_name}.mtl"
+        output_mtl_path = os.path.join(output_dir, output_mtl_name)
+        
+        if not self.copy_mtl_and_update_textures(output_mtl_path, output_dir):
+            return False, None
+        
+        # Update OBJ file to reference the MTL file
+        try:
+            # Read the OBJ file we just wrote
+            with open(output_obj_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            
+            # Check if mtllib already exists and update it, or add it
+            mtllib_found = False
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if stripped.lower().startswith('mtllib'):
+                    # Update existing mtllib line
+                    lines[i] = f"mtllib {output_mtl_name}\n"
+                    mtllib_found = True
+                    break
+            
+            if not mtllib_found:
+                # Add mtllib reference at the beginning (after comments)
+                insert_pos = 0
+                for i, line in enumerate(lines):
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith('#'):
+                        insert_pos = i
+                        break
+                
+                lines.insert(insert_pos, f"mtllib {output_mtl_name}\n")
+            
+            # Write updated OBJ with mtllib reference
+            with open(output_obj_path, 'w', encoding='utf-8') as f:
+                f.writelines(lines)
+            
+            return True, output_obj_path
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to update OBJ file: {str(e)}")
+            return False, None
 
 
 class ScalingGUI:
@@ -749,7 +960,24 @@ class ScalingGUI:
         self.scaler = OBJScaler()
         self.root = tk.Tk()
         self.root.title("OBJ Scaler")
-        self.root.geometry("500x400")
+        self.root.geometry("600x700")
+        
+        # Batch processing UI elements
+        self.batch_folder_path = None
+        self.file_listbox = None
+        self.file_list_scrollbar = None
+        
+        # Standard scales in mm (Y dimension)
+        self.standard_scales = {
+            'G': 81,
+            'O': 40,
+            'S': 29,
+            'HO': 20,
+            'N': 12,
+            '6in': 150,
+            '4in': 100,
+            '3in': 75
+        }
         
         self.setup_ui()
     
@@ -765,15 +993,69 @@ class ScalingGUI:
         
         ttk.Button(file_frame, text="Select OBJ", command=self.load_obj).pack(side=tk.RIGHT, padx=5)
         
+        # Batch processing frame
+        batch_frame = ttk.LabelFrame(self.root, text="Batch Processing", padding="10")
+        batch_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        # Folder selection
+        folder_frame = ttk.Frame(batch_frame)
+        folder_frame.pack(fill=tk.X, pady=5)
+        ttk.Button(folder_frame, text="Select Folder", command=self.select_batch_folder).pack(side=tk.LEFT, padx=5)
+        self.batch_folder_label = ttk.Label(folder_frame, text="No folder selected", foreground="gray")
+        self.batch_folder_label.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        
+        # File list with scrollbar
+        list_frame = ttk.Frame(batch_frame)
+        list_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        self.file_list_scrollbar = ttk.Scrollbar(list_frame)
+        self.file_list_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        self.file_listbox = tk.Listbox(list_frame, yscrollcommand=self.file_list_scrollbar.set, height=6)
+        self.file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.file_list_scrollbar.config(command=self.file_listbox.yview)
+        
+        # Bind selection events
+        self.file_listbox.bind('<<ListboxSelect>>', self.on_file_selected)
+        self.file_listbox.bind('<Return>', self.on_file_enter)
+        self.file_listbox.bind('<Button-1>', lambda e: self.file_listbox.focus_set())
+        
+        # File count label
+        self.file_count_label = ttk.Label(batch_frame, text="0 files found")
+        self.file_count_label.pack(pady=2)
+        
         # Bounding box info frame
         info_frame = ttk.LabelFrame(self.root, text="Bounding Box Information", padding="10")
         info_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         
-        self.info_text = tk.Text(info_frame, height=8, wrap=tk.WORD, state=tk.DISABLED)
+        self.info_text = tk.Text(info_frame, height=6, wrap=tk.WORD, state=tk.DISABLED)
         self.info_text.pack(fill=tk.BOTH, expand=True)
         
-        # Scaling input frame
-        scale_frame = ttk.LabelFrame(self.root, text="Target Dimensions (leave empty to keep original)", padding="10")
+        # Standard scales frame
+        scales_frame = ttk.LabelFrame(self.root, text="Standard Scales (Y dimension in mm)", padding="10")
+        scales_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        # First row of scale buttons
+        scale_row1 = ttk.Frame(scales_frame)
+        scale_row1.pack(fill=tk.X, pady=2)
+        ttk.Button(scale_row1, text="G (81mm)", command=lambda: self.create_scale('G')).pack(side=tk.LEFT, padx=2)
+        ttk.Button(scale_row1, text="O (40mm)", command=lambda: self.create_scale('O')).pack(side=tk.LEFT, padx=2)
+        ttk.Button(scale_row1, text="S (29mm)", command=lambda: self.create_scale('S')).pack(side=tk.LEFT, padx=2)
+        ttk.Button(scale_row1, text="HO (20mm)", command=lambda: self.create_scale('HO')).pack(side=tk.LEFT, padx=2)
+        
+        # Second row of scale buttons
+        scale_row2 = ttk.Frame(scales_frame)
+        scale_row2.pack(fill=tk.X, pady=2)
+        ttk.Button(scale_row2, text="N (12mm)", command=lambda: self.create_scale('N')).pack(side=tk.LEFT, padx=2)
+        ttk.Button(scale_row2, text="6in (150mm)", command=lambda: self.create_scale('6in')).pack(side=tk.LEFT, padx=2)
+        ttk.Button(scale_row2, text="4in (100mm)", command=lambda: self.create_scale('4in')).pack(side=tk.LEFT, padx=2)
+        ttk.Button(scale_row2, text="3in (75mm)", command=lambda: self.create_scale('3in')).pack(side=tk.LEFT, padx=2)
+        
+        # Create All button
+        ttk.Button(scales_frame, text="Create All Scales", command=self.create_all_scales).pack(pady=5)
+        
+        # Manual scaling input frame (keep for custom scales)
+        scale_frame = ttk.LabelFrame(self.root, text="Custom Scale (leave empty to keep original)", padding="10")
         scale_frame.pack(fill=tk.X, padx=10, pady=5)
         
         input_frame = ttk.Frame(scale_frame)
@@ -796,7 +1078,100 @@ class ScalingGUI:
         button_frame.pack(fill=tk.X)
         
         ttk.Button(button_frame, text="Show Visualization", command=self.show_visualization).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="Scale and Save", command=self.scale_and_save).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(button_frame, text="Custom Scale and Save", command=self.scale_and_save).pack(side=tk.RIGHT, padx=5)
+    
+    def scan_folder_for_obj_files(self, folder_path):
+        """Recursively scan folder and subfolders for OBJ files"""
+        obj_files = []
+        try:
+            for root, dirs, files in os.walk(folder_path):
+                for file in files:
+                    if file.lower().endswith('.obj'):
+                        full_path = os.path.join(root, file)
+                        obj_files.append(full_path)
+            obj_files.sort()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to scan folder: {str(e)}")
+        return obj_files
+    
+    def select_batch_folder(self):
+        """Open folder dialog to select folder for batch processing"""
+        folder_path = filedialog.askdirectory(title="Select Folder with OBJ Files")
+        if not folder_path:
+            return
+        
+        self.batch_folder_path = folder_path
+        self.batch_folder_label.config(text=os.path.basename(folder_path), foreground="black")
+        
+        # Scan for OBJ files
+        obj_files = self.scan_folder_for_obj_files(folder_path)
+        self.scaler.batch_file_list = obj_files
+        
+        # Update file listbox
+        self.file_listbox.delete(0, tk.END)
+        if len(obj_files) > 0:
+            # Show relative paths from selected folder
+            for file_path in obj_files:
+                rel_path = os.path.relpath(file_path, folder_path)
+                self.file_listbox.insert(tk.END, rel_path)
+            
+            self.file_count_label.config(text=f"{len(obj_files)} files found")
+            self.file_listbox.focus_set()
+        else:
+            self.file_count_label.config(text="0 files found")
+            messagebox.showinfo("Info", "No OBJ files found in selected folder")
+    
+    def on_file_selected(self, event=None):
+        """Handle file selection from listbox"""
+        if not self.file_listbox.curselection():
+            return
+        
+        selected_indices = self.file_listbox.curselection()
+        if not selected_indices:
+            return
+        
+        file_index = selected_indices[0]
+        self.navigate_to_file(file_index)
+    
+    def on_file_enter(self, event=None):
+        """Handle Enter key to load selected file"""
+        self.on_file_selected(event)
+        return "break"
+    
+    def navigate_to_file(self, file_index):
+        """Load and display the selected file"""
+        if file_index < 0 or file_index >= len(self.scaler.batch_file_list):
+            return
+        
+        file_path = self.scaler.batch_file_list[file_index]
+        
+        # Load new file
+        self.scaler.obj_path = file_path
+        self.scaler.current_file_index = file_index
+        
+        # Update file label
+        self.file_label.config(text=os.path.basename(file_path), foreground="black")
+        
+        # Find MTL file
+        self.scaler.find_mtl_file()
+        
+        # Parse the file
+        if not self.scaler.parse_obj_file():
+            messagebox.showerror("Error", f"Failed to parse OBJ file:\n{file_path}")
+            return
+        
+        # Update status
+        self.update_info_display()
+        
+        # Highlight current file in list
+        self.file_listbox.selection_clear(0, tk.END)
+        self.file_listbox.selection_set(file_index)
+        self.file_listbox.see(file_index)
+        self.file_listbox.activate(file_index)
+        self.file_listbox.focus_set()
+        
+        # Auto-open visualizer
+        self.show_visualization()
     
     def load_obj(self):
         """Load OBJ file"""
@@ -898,6 +1273,64 @@ class ScalingGUI:
             self.scaler.vertices = scaled_vertices
             self.scaler.calculate_bounding_box()
             self.update_info_display()
+    
+    def create_scale(self, scale_name):
+        """Create a scaled file for the given scale name"""
+        if self.scaler.extents is None:
+            messagebox.showwarning("Warning", "Please load an OBJ file first")
+            return
+        
+        if scale_name not in self.standard_scales:
+            messagebox.showerror("Error", f"Unknown scale: {scale_name}")
+            return
+        
+        target_y = self.standard_scales[scale_name]
+        
+        # Get output directory (scaled subdirectory of original file's directory)
+        obj_dir = os.path.dirname(self.scaler.obj_path)
+        output_dir = os.path.join(obj_dir, "scaled")
+        
+        # Create scaled file
+        success, output_path = self.scaler.create_scaled_file_with_mtl(target_y, scale_name, output_dir)
+        
+        if success:
+            messagebox.showinfo("Success", 
+                              f"Scaled file created:\n{os.path.basename(output_path)}\n\n"
+                              f"Scale: {scale_name} ({target_y}mm Y dimension)\n"
+                              f"Saved to: {output_dir}")
+        else:
+            messagebox.showerror("Error", f"Failed to create scaled file for {scale_name}")
+    
+    def create_all_scales(self):
+        """Create all standard scales at once"""
+        if self.scaler.extents is None:
+            messagebox.showwarning("Warning", "Please load an OBJ file first")
+            return
+        
+        # Get output directory
+        obj_dir = os.path.dirname(self.scaler.obj_path)
+        output_dir = os.path.join(obj_dir, "scaled")
+        
+        # Create all scales
+        created = []
+        failed = []
+        
+        for scale_name, target_y in self.standard_scales.items():
+            success, output_path = self.scaler.create_scaled_file_with_mtl(target_y, scale_name, output_dir)
+            if success:
+                created.append(scale_name)
+            else:
+                failed.append(scale_name)
+        
+        # Show results
+        message = f"Created {len(created)} scaled files:\n"
+        message += ", ".join(created) + "\n\n"
+        message += f"Saved to: {output_dir}"
+        
+        if failed:
+            message += f"\n\nFailed to create: {', '.join(failed)}"
+        
+        messagebox.showinfo("Batch Scale Complete", message)
     
     def run(self):
         """Run the GUI"""
