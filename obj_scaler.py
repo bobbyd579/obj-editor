@@ -99,7 +99,7 @@ class OBJScaler:
             return True
         return False
     
-    def parse_obj_file(self):
+    def parse_obj_file(self, suppress_dialogs=False):
         """Parse OBJ file to extract vertices, faces, and other data"""
         if not self.obj_path:
             return False
@@ -166,7 +166,8 @@ class OBJScaler:
             return True
             
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to parse OBJ file: {str(e)}")
+            if not suppress_dialogs:
+                messagebox.showerror("Error", f"Failed to parse OBJ file: {str(e)}")
             return False
     
     def calculate_bounding_box(self):
@@ -852,13 +853,14 @@ class OBJScaler:
         
         return None
     
-    def copy_mtl_and_update_textures(self, output_mtl_path, output_dir):
+    def copy_mtl_and_update_textures(self, output_mtl_path, output_dir, suppress_dialogs=False):
         """Copy MTL file and update texture paths to point to textures in output directory.
         Also copies all texture files to output directory.
         
         Args:
             output_mtl_path: Path where the new MTL file should be saved
             output_dir: Directory where textures should be copied
+            suppress_dialogs: If True, suppress error message dialogs (for batch processing)
             
         Returns:
             True if successful, False otherwise
@@ -931,10 +933,11 @@ class OBJScaler:
             return True
             
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to copy MTL file: {str(e)}")
+            if not suppress_dialogs:
+                messagebox.showerror("Error", f"Failed to copy MTL file: {str(e)}")
             return False
     
-    def create_scaled_file_with_mtl(self, target_y, scale_name, output_dir, rotate=False):
+    def create_scaled_file_with_mtl(self, target_y, scale_name, output_dir, rotate=False, suppress_dialogs=False):
         """Create a scaled OBJ file with MTL file (copied from original) pointing to textures.
         
         Args:
@@ -942,6 +945,7 @@ class OBJScaler:
             scale_name: Name for the scale (e.g., "G", "O", "S")
             output_dir: Directory to save the scaled files
             rotate: If True, rotate -90 degrees about X axis before saving
+            suppress_dialogs: If True, suppress error message dialogs (for batch processing)
             
         Returns:
             (success, output_path) tuple
@@ -972,7 +976,7 @@ class OBJScaler:
         output_mtl_name = f"{obj_name}_{scale_name}.mtl"
         output_mtl_path = os.path.join(output_dir, output_mtl_name)
         
-        if not self.copy_mtl_and_update_textures(output_mtl_path, output_dir):
+        if not self.copy_mtl_and_update_textures(output_mtl_path, output_dir, suppress_dialogs=suppress_dialogs):
             return False, None
         
         # Update OBJ file to reference the MTL file
@@ -1009,7 +1013,8 @@ class OBJScaler:
             return True, output_obj_path
             
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to update OBJ file: {str(e)}")
+            if not suppress_dialogs:
+                messagebox.showerror("Error", f"Failed to update OBJ file: {str(e)}")
             return False, None
 
 
@@ -1018,7 +1023,7 @@ class ScalingGUI:
         self.scaler = OBJScaler()
         self.root = tk.Tk()
         self.root.title("OBJ Scaler")
-        self.root.geometry("800x900")  # Larger initial size to show all buttons and panes
+        self.root.geometry("900x1000")  # Larger initial size to show all buttons, panes, and log window
         
         # Batch processing UI elements
         self.batch_folder_path = None
@@ -1089,6 +1094,25 @@ class ScalingGUI:
         self.info_text = tk.Text(info_frame, height=6, wrap=tk.WORD, state=tk.DISABLED)
         self.info_text.pack(fill=tk.BOTH, expand=True)
         
+        # Log window frame
+        log_frame = ttk.LabelFrame(self.root, text="Processing Log", padding="10")
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        # Log text area with scrollbar
+        log_text_frame = ttk.Frame(log_frame)
+        log_text_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.log_scrollbar = ttk.Scrollbar(log_text_frame)
+        self.log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        self.log_text = tk.Text(log_text_frame, height=8, wrap=tk.WORD, state=tk.DISABLED, 
+                               yscrollcommand=self.log_scrollbar.set)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.log_scrollbar.config(command=self.log_text.yview)
+        
+        # Clear log button
+        ttk.Button(log_frame, text="Clear Log", command=self.clear_log).pack(pady=5)
+        
         # Standard scales frame
         scales_frame = ttk.LabelFrame(self.root, text="Standard Scales (Y dimension in mm)", padding="10")
         scales_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -1115,6 +1139,13 @@ class ScalingGUI:
         self.rotate_checkbox_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(rotation_frame, text="Rotate -90° about X axis (Y→-Z, Z→Y)", 
                        variable=self.rotate_checkbox_var).pack(side=tk.LEFT, padx=5)
+        
+        # Run All checkbox
+        run_all_frame = ttk.Frame(scales_frame)
+        run_all_frame.pack(fill=tk.X, pady=5)
+        self.run_all_checkbox_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(run_all_frame, text="Run All: Process all files in folder", 
+                       variable=self.run_all_checkbox_var).pack(side=tk.LEFT, padx=5)
         
         # Create All button
         ttk.Button(scales_frame, text="Create All Scales", command=self.create_all_scales).pack(pady=5)
@@ -1278,6 +1309,29 @@ class ScalingGUI:
         
         self.info_text.config(state=tk.DISABLED)
     
+    def log_message(self, message, newline=True):
+        """Append a message to the log window
+        
+        Args:
+            message: Message to append
+            newline: If True, add newline at end (default True)
+        """
+        self.log_text.config(state=tk.NORMAL)
+        if newline:
+            self.log_text.insert(tk.END, message + "\n")
+        else:
+            self.log_text.insert(tk.END, message)
+        self.log_text.see(tk.END)  # Auto-scroll to bottom
+        self.log_text.config(state=tk.DISABLED)
+        # Force GUI update
+        self.root.update_idletasks()
+    
+    def clear_log(self):
+        """Clear the log window"""
+        self.log_text.config(state=tk.NORMAL)
+        self.log_text.delete(1.0, tk.END)
+        self.log_text.config(state=tk.DISABLED)
+    
     def show_visualization(self):
         """Show 3D visualization"""
         if self.scaler.extents is None:
@@ -1339,71 +1393,268 @@ class ScalingGUI:
             self.scaler.calculate_bounding_box()
             self.update_info_display()
     
-    def create_scale(self, scale_name):
-        """Create a scaled file for the given scale name"""
-        if self.scaler.extents is None:
-            messagebox.showwarning("Warning", "Please load an OBJ file first")
-            return
+    def is_scaled_file(self, file_path):
+        """Check if a file is already a scaled file (in scaled folder or has scale suffix)"""
+        # Check if file is in a "scaled" subdirectory
+        normalized_path = os.path.normpath(file_path)
+        if 'scaled' in normalized_path.split(os.sep):
+            return True
+        
+        # Check if filename has a scale suffix (e.g., _G, _O, _S, etc.)
+        base_name = os.path.splitext(os.path.basename(file_path))[0]
+        for scale_name in self.standard_scales.keys():
+            if base_name.endswith(f'_{scale_name}'):
+                return True
+        
+        return False
+    
+    def get_original_files(self):
+        """Get list of original files (excluding scaled files) from batch_file_list"""
+        if not self.scaler.batch_file_list:
+            return []
+        
+        original_files = []
+        for file_path in self.scaler.batch_file_list:
+            if not self.is_scaled_file(file_path):
+                original_files.append(file_path)
+        
+        return original_files
+    
+    def create_scale_for_file(self, file_path, scale_name, suppress_dialogs=False):
+        """Create a scaled file for a specific file and scale name"""
+        # Load the file
+        self.scaler.obj_path = file_path
+        self.scaler.find_mtl_file()
+        
+        if not self.scaler.parse_obj_file(suppress_dialogs=suppress_dialogs):
+            return False
         
         if scale_name not in self.standard_scales:
-            messagebox.showerror("Error", f"Unknown scale: {scale_name}")
-            return
+            if not suppress_dialogs:
+                messagebox.showerror("Error", f"Unknown scale: {scale_name}")
+            return False
         
         target_y = self.standard_scales[scale_name]
         
         # Get output directory (scaled subdirectory of original file's directory)
-        obj_dir = os.path.dirname(self.scaler.obj_path)
+        obj_dir = os.path.dirname(file_path)
         output_dir = os.path.join(obj_dir, "scaled")
         
         # Get rotation setting from checkbox
         rotate = self.rotate_checkbox_var.get()
         
         # Create scaled file
-        success, output_path = self.scaler.create_scaled_file_with_mtl(target_y, scale_name, output_dir, rotate=rotate)
+        success, output_path = self.scaler.create_scaled_file_with_mtl(target_y, scale_name, output_dir, rotate=rotate, suppress_dialogs=suppress_dialogs)
         
-        if success:
-            rotate_text = " (rotated -90° about X)" if rotate else ""
-            messagebox.showinfo("Success", 
-                              f"Scaled file created:\n{os.path.basename(output_path)}\n\n"
-                              f"Scale: {scale_name} ({target_y}mm Y dimension){rotate_text}\n"
-                              f"Saved to: {output_dir}")
+        return success
+    
+    def create_scale(self, scale_name):
+        """Create a scaled file for the given scale name"""
+        if scale_name not in self.standard_scales:
+            messagebox.showerror("Error", f"Unknown scale: {scale_name}")
+            return
+        
+        # Check if "Run All" is enabled
+        run_all = self.run_all_checkbox_var.get()
+        
+        if run_all:
+            # Process all original files in the folder
+            original_files = self.get_original_files()
+            
+            if not original_files:
+                messagebox.showwarning("Warning", "No original OBJ files found in folder")
+                return
+            
+            # Clear log and start batch processing
+            self.clear_log()
+            self.log_message(f"Starting batch processing: Scale {scale_name} ({self.standard_scales[scale_name]}mm)")
+            self.log_message(f"Found {len(original_files)} files to process")
+            self.log_message("-" * 60)
+            
+            # Batch process all files
+            processed = 0
+            failed = 0
+            
+            for i, file_path in enumerate(original_files, 1):
+                file_name = os.path.basename(file_path)
+                self.log_message(f"[{i}/{len(original_files)}] Processing: {file_name}")
+                self.root.update_idletasks()
+                
+                if self.create_scale_for_file(file_path, scale_name, suppress_dialogs=True):
+                    processed += 1
+                    self.log_message(f"  ✓ Success: Created {scale_name} scale")
+                else:
+                    failed += 1
+                    self.log_message(f"  ✗ Failed: Could not process file")
+            
+            # Show summary
+            self.log_message("-" * 60)
+            self.log_message(f"Batch processing complete!")
+            self.log_message(f"  Successfully processed: {processed} files")
+            self.log_message(f"  Failed: {failed} files")
+            
+            # Also show summary dialog
+            messagebox.showinfo("Batch Processing Complete", 
+                              f"Processed {processed} files successfully\n"
+                              f"Failed: {failed} files\n\n"
+                              f"Scale: {scale_name} ({self.standard_scales[scale_name]}mm)")
         else:
-            messagebox.showerror("Error", f"Failed to create scaled file for {scale_name}")
+            # Process current file only
+            if self.scaler.extents is None:
+                messagebox.showwarning("Warning", "Please load an OBJ file first")
+                return
+            
+            target_y = self.standard_scales[scale_name]
+            
+            # Get output directory (scaled subdirectory of original file's directory)
+            obj_dir = os.path.dirname(self.scaler.obj_path)
+            output_dir = os.path.join(obj_dir, "scaled")
+            
+            # Get rotation setting from checkbox
+            rotate = self.rotate_checkbox_var.get()
+            
+            # Create scaled file
+            success, output_path = self.scaler.create_scaled_file_with_mtl(target_y, scale_name, output_dir, rotate=rotate)
+            
+            if success:
+                rotate_text = " (rotated -90° about X)" if rotate else ""
+                messagebox.showinfo("Success", 
+                                  f"Scaled file created:\n{os.path.basename(output_path)}\n\n"
+                                  f"Scale: {scale_name} ({target_y}mm Y dimension){rotate_text}\n"
+                                  f"Saved to: {output_dir}")
+            else:
+                messagebox.showerror("Error", f"Failed to create scaled file for {scale_name}")
     
     def create_all_scales(self):
         """Create all standard scales at once"""
-        if self.scaler.extents is None:
-            messagebox.showwarning("Warning", "Please load an OBJ file first")
-            return
+        # Check if "Run All" is enabled
+        run_all = self.run_all_checkbox_var.get()
         
-        # Get output directory
-        obj_dir = os.path.dirname(self.scaler.obj_path)
-        output_dir = os.path.join(obj_dir, "scaled")
-        
-        # Get rotation setting from checkbox
-        rotate = self.rotate_checkbox_var.get()
-        
-        # Create all scales
-        created = []
-        failed = []
-        
-        for scale_name, target_y in self.standard_scales.items():
-            success, output_path = self.scaler.create_scaled_file_with_mtl(target_y, scale_name, output_dir, rotate=rotate)
-            if success:
-                created.append(scale_name)
-            else:
-                failed.append(scale_name)
-        
-        # Show results
-        rotate_text = " (rotated -90° about X)" if rotate else ""
-        message = f"Created {len(created)} scaled files{rotate_text}:\n"
-        message += ", ".join(created) + "\n\n"
-        message += f"Saved to: {output_dir}"
-        
-        if failed:
-            message += f"\n\nFailed to create: {', '.join(failed)}"
-        
-        messagebox.showinfo("Batch Scale Complete", message)
+        if run_all:
+            # Process all original files in the folder
+            original_files = self.get_original_files()
+            
+            if not original_files:
+                messagebox.showwarning("Warning", "No original OBJ files found in folder")
+                return
+            
+            # Get rotation setting from checkbox
+            rotate = self.rotate_checkbox_var.get()
+            rotate_text = " (with -90° X rotation)" if rotate else ""
+            
+            # Clear log and start batch processing
+            self.clear_log()
+            self.log_message(f"Starting batch processing: All scales{rotate_text}")
+            self.log_message(f"Found {len(original_files)} files to process")
+            self.log_message("-" * 60)
+            
+            # Batch process all files with all scales
+            total_processed = 0
+            total_failed = 0
+            files_processed = 0
+            files_failed = 0
+            
+            for file_idx, file_path in enumerate(original_files, 1):
+                file_name = os.path.basename(file_path)
+                self.log_message(f"\n[{file_idx}/{len(original_files)}] Processing: {file_name}")
+                self.root.update_idletasks()
+                
+                file_success = True
+                file_created = []
+                file_failed = []
+                
+                # Load the file
+                self.scaler.obj_path = file_path
+                self.scaler.find_mtl_file()
+                
+                if not self.scaler.parse_obj_file(suppress_dialogs=True):
+                    self.log_message(f"  ✗ Failed to parse file")
+                    files_failed += 1
+                    total_failed += len(self.standard_scales)
+                    continue
+                
+                # Get output directory
+                obj_dir = os.path.dirname(file_path)
+                output_dir = os.path.join(obj_dir, "scaled")
+                
+                # Create all scales for this file
+                for scale_name, target_y in self.standard_scales.items():
+                    self.log_message(f"  Creating {scale_name} scale...", newline=False)
+                    self.root.update_idletasks()
+                    
+                    success, output_path = self.scaler.create_scaled_file_with_mtl(
+                        target_y, scale_name, output_dir, rotate=rotate, suppress_dialogs=True
+                    )
+                    if success:
+                        file_created.append(scale_name)
+                        total_processed += 1
+                        self.log_message(f" ✓")
+                    else:
+                        file_failed.append(scale_name)
+                        total_failed += 1
+                        file_success = False
+                        self.log_message(f" ✗")
+                
+                if file_success:
+                    files_processed += 1
+                    self.log_message(f"  All scales created successfully")
+                else:
+                    files_failed += 1
+                    if file_created:
+                        self.log_message(f"  Created: {', '.join(file_created)}")
+                    if file_failed:
+                        self.log_message(f"  Failed: {', '.join(file_failed)}")
+            
+            # Show summary
+            self.log_message("\n" + "-" * 60)
+            self.log_message(f"Batch processing complete{rotate_text}!")
+            self.log_message(f"  Files processed successfully: {files_processed}")
+            self.log_message(f"  Files with errors: {files_failed}")
+            self.log_message(f"  Total scales created: {total_processed}")
+            self.log_message(f"  Total scales failed: {total_failed}")
+            
+            # Also show summary dialog
+            message = f"Batch Processing Complete{rotate_text}:\n\n"
+            message += f"Files processed: {files_processed}\n"
+            message += f"Files with errors: {files_failed}\n"
+            message += f"Total scales created: {total_processed}\n"
+            message += f"Total scales failed: {total_failed}"
+            
+            messagebox.showinfo("Batch Scale Complete", message)
+        else:
+            # Process current file only
+            if self.scaler.extents is None:
+                messagebox.showwarning("Warning", "Please load an OBJ file first")
+                return
+            
+            # Get output directory
+            obj_dir = os.path.dirname(self.scaler.obj_path)
+            output_dir = os.path.join(obj_dir, "scaled")
+            
+            # Get rotation setting from checkbox
+            rotate = self.rotate_checkbox_var.get()
+            
+            # Create all scales
+            created = []
+            failed = []
+            
+            for scale_name, target_y in self.standard_scales.items():
+                success, output_path = self.scaler.create_scaled_file_with_mtl(target_y, scale_name, output_dir, rotate=rotate)
+                if success:
+                    created.append(scale_name)
+                else:
+                    failed.append(scale_name)
+            
+            # Show results
+            rotate_text = " (rotated -90° about X)" if rotate else ""
+            message = f"Created {len(created)} scaled files{rotate_text}:\n"
+            message += ", ".join(created) + "\n\n"
+            message += f"Saved to: {output_dir}"
+            
+            if failed:
+                message += f"\n\nFailed to create: {', '.join(failed)}"
+            
+            messagebox.showinfo("Batch Scale Complete", message)
     
     def run(self):
         """Run the GUI"""
