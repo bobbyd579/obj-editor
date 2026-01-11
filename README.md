@@ -90,3 +90,4 @@ The scaled file will be saved as `[original_name]_scaled.obj` in the same direct
 - OpenGL-compatible graphics card
 - Windows, Linux, or macOS
 
+
