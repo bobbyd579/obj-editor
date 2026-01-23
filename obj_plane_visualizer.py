@@ -58,8 +58,9 @@ class OBJPlaneVisualizer:
         # Selection state
         self.selected_vertices = []  # List of 3 vertex indices
         self.plane_equation = None  # [a, b, c, d] for ax + by + cz + d = 0
-        self.distance_threshold = 1.0  # Distance in OBJ units
-        self.vertex_distances = None  # Distance from each vertex to plane
+        self.distance_threshold_positive = 1.0  # Distance threshold in positive direction (normal side)
+        self.distance_threshold_negative = 1.0  # Distance threshold in negative direction (opposite to normal)
+        self.vertex_distances = None  # Signed distance from each vertex to plane
         self.vertices_within_threshold = set()  # Set of vertex indices within threshold
         
         # Visualization state
@@ -81,6 +82,13 @@ class OBJPlaneVisualizer:
         self.edge_loop_selection_mode = False  # True = select edge loops, False = select vertices
         self.open_edges = []  # List of open edges: [(v1, v2), ...]
         self.show_open_edges = True  # Flag to show/hide open edges
+        
+        # Free-space selection state (for orthographic views)
+        self.free_space_point1 = None  # First clicked point in world coordinates [x, y, z]
+        self.free_space_point2 = None  # Second clicked point in world coordinates [x, y, z]
+        self.current_mouse_world_pos = None  # Current mouse position in world coordinates for line preview
+        self.pending_free_space_click = None  # (x, y, width, height) for screen-space free-space click
+        self.pending_mouse_track = None  # (x, y, width, height) for mouse position tracking
         
         # Batch processing state
         self.has_unsaved_changes = False  # Flag to track if current file has been modified
@@ -997,17 +1005,131 @@ class OBJPlaneVisualizer:
         # Return plane equation [a, b, c, d]
         return np.array([normal[0], normal[1], normal[2], d])
     
+    def calculate_plane_from_two_points_orthographic(self, p1, p2, view_type):
+        """Calculate plane equation from 2 points in orthographic view.
+        
+        The plane is perpendicular to the view plane and contains the line between p1 and p2.
+        The normal points in the positive direction of the view axis.
+        
+        Args:
+            p1: First 3D point [x, y, z]
+            p2: Second 3D point [x, y, z]
+            view_type: 'xy', 'yz', or 'xz'
+        
+        Returns:
+            Plane equation [a, b, c, d] for ax + by + cz + d = 0
+        """
+        p1 = np.array(p1)
+        p2 = np.array(p2)
+        
+        # Calculate the average coordinate along the view axis
+        # This determines where the plane sits along that axis
+        if view_type == 'xy':
+            # Looking down Z-axis, plane normal is (0, 0, 1) pointing in +Z
+            # Use average Z coordinate of the two points
+            avg_z = (p1[2] + p2[2]) / 2.0
+            normal = np.array([0.0, 0.0, 1.0])
+            d = -avg_z  # For z = avg_z, we have z - avg_z = 0, so 0*z + 0*y + 1*z - avg_z = 0
+        elif view_type == 'yz':
+            # Looking down X-axis, plane normal is (1, 0, 0) pointing in +X
+            # Use average X coordinate of the two points
+            avg_x = (p1[0] + p2[0]) / 2.0
+            normal = np.array([1.0, 0.0, 0.0])
+            d = -avg_x  # For x = avg_x, we have x - avg_x = 0
+        elif view_type == 'xz':
+            # Looking down Y-axis, plane normal is (0, 1, 0) pointing in +Y
+            # Use average Y coordinate of the two points
+            avg_y = (p1[1] + p2[1]) / 2.0
+            normal = np.array([0.0, 1.0, 0.0])
+            d = -avg_y  # For y = avg_y, we have y - avg_y = 0
+        else:
+            raise ValueError(f"Invalid view_type: {view_type}. Must be 'xy', 'yz', or 'xz'")
+        
+        # Return plane equation [a, b, c, d]
+        return np.array([normal[0], normal[1], normal[2], d])
+    
+    def screen_to_world_on_view_plane(self, mouse_x, mouse_y, width, height, view_type):
+        """Convert screen coordinates to world coordinates on the view plane.
+        
+        Uses gluUnProject to unproject screen coordinates to the view plane.
+        For XY view: projects to z=0
+        For YZ view: projects to x=0
+        For XZ view: projects to y=0
+        
+        Args:
+            mouse_x: Screen X coordinate (framebuffer coordinates)
+            mouse_y: Screen Y coordinate (framebuffer coordinates, top-left origin)
+            width: Framebuffer width
+            height: Framebuffer height
+            view_type: 'xy', 'yz', or 'xz'
+        
+        Returns:
+            3D world coordinate [x, y, z] on the view plane, or None if unprojection fails
+        """
+        from OpenGL.GL import glGetDoublev, GL_MODELVIEW_MATRIX, GL_PROJECTION_MATRIX, GL_VIEWPORT, GL_TRUE
+        from OpenGL.GLU import gluUnProject
+        import ctypes
+        
+        # Get current matrices and viewport
+        modelview = (ctypes.c_double * 16)()
+        projection = (ctypes.c_double * 16)()
+        viewport = (ctypes.c_int * 4)()
+        
+        glGetDoublev(GL_MODELVIEW_MATRIX, modelview)
+        glGetDoublev(GL_PROJECTION_MATRIX, projection)
+        glGetIntegerv(GL_VIEWPORT, viewport)
+        
+        # Convert Y coordinate (screen Y is top-left, OpenGL is bottom-left)
+        win_y = height - mouse_y
+        
+        # For orthographic projection, we need to unproject to the view plane
+        # Try unprojecting at the center depth (0.5) first
+        win_z = 0.5
+        
+        # PyOpenGL's gluUnProject returns a tuple (objX, objY, objZ) or None on failure
+        try:
+            result = gluUnProject(
+                mouse_x,
+                win_y,
+                win_z,
+                modelview,
+                projection,
+                viewport
+            )
+            
+            if result is not None:
+                obj_x, obj_y, obj_z = result
+                world_point = np.array([float(obj_x), float(obj_y), float(obj_z)])
+            
+                # Project to the view plane based on view type
+                if view_type == 'xy':
+                    # Set z = 0 (view plane)
+                    world_point[2] = 0.0
+                elif view_type == 'yz':
+                    # Set x = 0 (view plane)
+                    world_point[0] = 0.0
+                elif view_type == 'xz':
+                    # Set y = 0 (view plane)
+                    world_point[1] = 0.0
+                
+                return world_point
+            else:
+                return None
+        except:
+            return None
+    
     def calculate_vertex_distances(self):
-        """Calculate distance from each vertex to the plane"""
+        """Calculate signed distance from each vertex to the plane"""
         if self.plane_equation is None:
             self.vertex_distances = None
             return
         
         a, b, c, d = self.plane_equation
         
-        # Point-to-plane distance: |ax + by + cz + d| / sqrt(a² + b² + c²)
+        # Point-to-plane signed distance: (ax + by + cz + d) / sqrt(a² + b² + c²)
         # Since normal is normalized, denominator is 1.0
-        distances = np.abs(
+        # Positive values = on normal side, negative values = on opposite side
+        distances = (
             a * self.vertices[:, 0] + 
             b * self.vertices[:, 1] + 
             c * self.vertices[:, 2] + d
@@ -1015,9 +1137,15 @@ class OBJPlaneVisualizer:
         
         self.vertex_distances = distances
         
-        # Find vertices within threshold
+        # Find vertices within threshold (bidirectional)
+        # Positive side: 0 <= distance <= threshold_positive
+        # Negative side: -threshold_negative <= distance <= 0
+        positive_mask = (distances >= 0) & (distances <= self.distance_threshold_positive)
+        negative_mask = (distances <= 0) & (distances >= -self.distance_threshold_negative)
+        within_threshold_mask = positive_mask | negative_mask
+        
         self.vertices_within_threshold = set(
-            np.where(distances <= self.distance_threshold)[0]
+            np.where(within_threshold_mask)[0]
         )
     
     def screen_to_world_ray(self, mouse_x, mouse_y, width, height, view_matrix, proj_matrix):
@@ -1216,8 +1344,13 @@ class OBJPlaneVisualizer:
                         self.pending_edge_click = (xpos_fb, ypos_fb, width, height)
                         print(f"DEBUG: Set pending_edge_click = ({xpos_fb}, {ypos_fb}, {width}, {height})")
                     else:
-                        # Vertex selection mode
-                        self.pending_click = (xpos_fb, ypos_fb, width, height)
+                        # Check if we're in orthographic view (free-space selection mode)
+                        if self.orthographic_view is not None:
+                            # Free-space selection mode for orthographic views
+                            self.pending_free_space_click = (xpos_fb, ypos_fb, width, height)
+                        else:
+                            # Vertex selection mode for perspective view
+                            self.pending_click = (xpos_fb, ypos_fb, width, height)
             
             elif action == glfw.RELEASE:
                 # On release, if it was a click (no significant movement) and Shift was held, edge selection will be processed
@@ -1227,6 +1360,23 @@ class OBJPlaneVisualizer:
         
         def cursor_pos_callback(window, xpos, ypos):
             nonlocal last_x, last_y, rotation_x, rotation_y, pan_x, pan_y, mouse_has_moved, click_start_x, click_start_y
+            # Track mouse position for free-space line preview in orthographic views
+            if self.orthographic_view is not None and self.free_space_point1 is not None and self.free_space_point2 is None:
+                # Get framebuffer size and convert window coordinates
+                width, height = glfw.get_framebuffer_size(window)
+                window_width, window_height = glfw.get_window_size(window)
+                if window_width > 0 and window_height > 0:
+                    scale_x = width / window_width
+                    scale_y = height / window_height
+                    xpos_fb = xpos * scale_x
+                    ypos_fb = ypos * scale_y
+                else:
+                    xpos_fb = xpos
+                    ypos_fb = ypos
+                # Store for processing after matrices are set up
+                self.pending_mouse_track = (xpos_fb, ypos_fb, width, height)
+                self.needs_redraw = True
+            
             if mouse_down:
                 # Check if mouse has moved significantly (more than 5 pixels from click start)
                 if not mouse_has_moved:
@@ -1274,12 +1424,33 @@ class OBJPlaneVisualizer:
                 zoom = max(0.05, min(20.0, zoom))  # Wider zoom range
                 self.needs_redraw = True
         
+        def key_callback(window, key, scancode, action, mods):
+            """Handle keyboard input"""
+            if action == glfw.PRESS:
+                if key == glfw.KEY_ESCAPE:
+                    # Cancel free-space selection if first point is selected
+                    if self.free_space_point1 is not None:
+                        self.free_space_point1 = None
+                        self.free_space_point2 = None
+                        self.current_mouse_world_pos = None
+                        self.needs_redraw = True
+                        # Update GUI status
+                        if self.gui:
+                            try:
+                                self.gui.root.after(0, self.gui.update_status)
+                            except:
+                                pass
+        
         glfw.set_mouse_button_callback(window, mouse_button_callback)
         glfw.set_cursor_pos_callback(window, cursor_pos_callback)
         glfw.set_scroll_callback(window, scroll_callback)
+        glfw.set_key_callback(window, key_callback)
         
         # Enable vsync for better performance
         glfw.swap_interval(1)
+        
+        # Track previous orthographic view to detect view changes
+        previous_orthographic_view = None
         
         # Main render loop - simplified for better performance
         while not glfw.window_should_close(window) and not self.close_window_flag:
@@ -1301,12 +1472,25 @@ class OBJPlaneVisualizer:
                 camera_x = initial_camera_x
                 camera_y = initial_camera_y
                 camera_z = initial_camera_z
+                previous_orthographic_view = self.orthographic_view
                 self.orthographic_view = None  # Reset to perspective
+                # Reset selection when switching from orthographic to perspective
+                if previous_orthographic_view is not None:
+                    self.selected_vertices = []
+                    self.plane_equation = None
+                    self.vertex_distances = None
+                    self.vertices_within_threshold = set()
+                    # Clear free-space selection
+                    self.free_space_point1 = None
+                    self.free_space_point2 = None
+                    self.current_mouse_world_pos = None
+                previous_orthographic_view = None
                 self.reset_view_flag = False
             
             # Check for plane view flags
             if self.view_xy_flag:
                 # XY plane view (top view) - look down Z-axis, orthographic
+                previous_orthographic_view = self.orthographic_view
                 rotation_x = 0.0
                 rotation_y = 0.0
                 zoom = 1.0
@@ -1314,10 +1498,21 @@ class OBJPlaneVisualizer:
                 pan_y = 0.0
                 camera_distance = initial_camera_distance
                 self.orthographic_view = 'xy'
+                # Reset selection when switching view types
+                if previous_orthographic_view != 'xy':
+                    self.selected_vertices = []
+                    self.plane_equation = None
+                    self.vertex_distances = None
+                    self.vertices_within_threshold = set()
+                    # Clear free-space selection
+                    self.free_space_point1 = None
+                    self.free_space_point2 = None
+                    self.current_mouse_world_pos = None
                 self.view_xy_flag = False
             
             if self.view_yz_flag:
                 # YZ plane view (front view) - look down X-axis, orthographic
+                previous_orthographic_view = self.orthographic_view
                 rotation_x = 0.0
                 rotation_y = 0.0
                 zoom = 1.0
@@ -1325,10 +1520,21 @@ class OBJPlaneVisualizer:
                 pan_y = 0.0
                 camera_distance = initial_camera_distance
                 self.orthographic_view = 'yz'
+                # Reset selection when switching view types
+                if previous_orthographic_view != 'yz':
+                    self.selected_vertices = []
+                    self.plane_equation = None
+                    self.vertex_distances = None
+                    self.vertices_within_threshold = set()
+                    # Clear free-space selection
+                    self.free_space_point1 = None
+                    self.free_space_point2 = None
+                    self.current_mouse_world_pos = None
                 self.view_yz_flag = False
             
             if self.view_xz_flag:
                 # XZ plane view (side view) - look down Y-axis, orthographic
+                previous_orthographic_view = self.orthographic_view
                 rotation_x = 0.0
                 rotation_y = 0.0
                 zoom = 1.0
@@ -1336,6 +1542,16 @@ class OBJPlaneVisualizer:
                 pan_y = 0.0
                 camera_distance = initial_camera_distance
                 self.orthographic_view = 'xz'
+                # Reset selection when switching view types
+                if previous_orthographic_view != 'xz':
+                    self.selected_vertices = []
+                    self.plane_equation = None
+                    self.vertex_distances = None
+                    self.vertices_within_threshold = set()
+                    # Clear free-space selection
+                    self.free_space_point1 = None
+                    self.free_space_point2 = None
+                    self.current_mouse_world_pos = None
                 self.view_xz_flag = False
             
             # Clear
@@ -1541,6 +1757,67 @@ class OBJPlaneVisualizer:
                         print(f"DEBUG: No edge found near click position")
                         pass
             
+            # Process pending mouse tracking for free-space line preview (after matrices are set up)
+            if self.pending_mouse_track is not None:
+                track_x, track_y, track_width, track_height = self.pending_mouse_track
+                self.pending_mouse_track = None  # Clear immediately
+                
+                # Convert to world coordinates on view plane
+                if self.orthographic_view is not None:
+                    world_pos = self.screen_to_world_on_view_plane(track_x, track_y, track_width, track_height, self.orthographic_view)
+                    if world_pos is not None:
+                        self.current_mouse_world_pos = world_pos
+            
+            # Process pending free-space click (after matrices are set up)
+            if self.pending_free_space_click is not None:
+                click_x, click_y, click_width, click_height = self.pending_free_space_click
+                self.pending_free_space_click = None  # Clear immediately
+                
+                # Convert to world coordinates on view plane
+                if self.orthographic_view is not None:
+                    world_pos = self.screen_to_world_on_view_plane(click_x, click_y, click_width, click_height, self.orthographic_view)
+                    if world_pos is not None:
+                        if self.free_space_point1 is None:
+                            # First point
+                            self.free_space_point1 = world_pos
+                            self.current_mouse_world_pos = world_pos
+                            # Update GUI status
+                            if self.gui:
+                                try:
+                                    self.gui.root.after(0, self.gui.update_status)
+                                except:
+                                    pass
+                        else:
+                            # Second point - calculate plane
+                            self.free_space_point2 = world_pos
+                            
+                            # Create third point by offsetting second point along view axis
+                            if self.orthographic_view == 'xy':
+                                # p3 = (x2, y2, 1) where p2 = (x2, y2, 0)
+                                p3 = np.array([world_pos[0], world_pos[1], 1.0])
+                            elif self.orthographic_view == 'yz':
+                                # p3 = (1, y2, z2) where p2 = (0, y2, z2)
+                                p3 = np.array([1.0, world_pos[1], world_pos[2]])
+                            elif self.orthographic_view == 'xz':
+                                # p3 = (x2, 1, z2) where p2 = (x2, 0, z2)
+                                p3 = np.array([world_pos[0], 1.0, world_pos[2]])
+                            
+                            # Calculate plane from 3 points
+                            plane = self.calculate_plane_from_points(self.free_space_point1, world_pos, p3)
+                            if plane is not None:
+                                self.plane_equation = plane
+                                self.calculate_vertex_distances()
+                                # Clear free-space points
+                                self.free_space_point1 = None
+                                self.free_space_point2 = None
+                                self.current_mouse_world_pos = None
+                                # Update GUI status
+                                if self.gui:
+                                    try:
+                                        self.gui.root.after(0, self.gui.update_status)
+                                    except:
+                                        pass
+            
             # Process pending click for vertex selection (after matrices are set up)
             if self.pending_click is not None:
                 click_x, click_y, click_width, click_height = self.pending_click
@@ -1550,31 +1827,52 @@ class OBJPlaneVisualizer:
                 nearest = self.find_nearest_vertex_screen_space(click_x, click_y, click_width, click_height)
                 
                 if nearest is not None:
-                    if len(self.selected_vertices) < 3:
+                    # Check if we're in orthographic view (2-point mode) or perspective view (3-point mode)
+                    is_orthographic = self.orthographic_view is not None
+                    max_vertices = 2 if is_orthographic else 3
+                    
+                    if len(self.selected_vertices) < max_vertices:
                         if nearest not in self.selected_vertices:
                             self.selected_vertices.append(nearest)
                             
-                            # If we have 3 vertices, calculate plane
-                            if len(self.selected_vertices) == 3:
-                                p1 = self.vertices[self.selected_vertices[0]]
-                                p2 = self.vertices[self.selected_vertices[1]]
-                                p3 = self.vertices[self.selected_vertices[2]]
-                                
-                                plane = self.calculate_plane_from_points(p1, p2, p3)
-                                if plane is not None:
-                                    self.plane_equation = plane
-                                    self.calculate_vertex_distances()
-                                    # Update GUI status (use threading-safe method)
-                                    if self.gui:
-                                        try:
-                                            self.gui.root.after(0, self.gui.update_status)
-                                        except:
-                                            pass
+                            # If we have enough vertices, calculate plane
+                            if len(self.selected_vertices) == max_vertices:
+                                if is_orthographic:
+                                    # 2-point selection in orthographic view
+                                    p1 = self.vertices[self.selected_vertices[0]]
+                                    p2 = self.vertices[self.selected_vertices[1]]
+                                    
+                                    plane = self.calculate_plane_from_two_points_orthographic(p1, p2, self.orthographic_view)
+                                    if plane is not None:
+                                        self.plane_equation = plane
+                                        self.calculate_vertex_distances()
+                                        # Update GUI status (use threading-safe method)
+                                        if self.gui:
+                                            try:
+                                                self.gui.root.after(0, self.gui.update_status)
+                                            except:
+                                                pass
                                 else:
-                                    # Show warning in a thread-safe way
-                                    if self.gui:
-                                        self.gui.root.after(0, lambda: messagebox.showwarning("Warning", "Selected points are collinear. Please select 3 non-collinear points."))
-                                    self.selected_vertices.pop()
+                                    # 3-point selection in perspective view
+                                    p1 = self.vertices[self.selected_vertices[0]]
+                                    p2 = self.vertices[self.selected_vertices[1]]
+                                    p3 = self.vertices[self.selected_vertices[2]]
+                                    
+                                    plane = self.calculate_plane_from_points(p1, p2, p3)
+                                    if plane is not None:
+                                        self.plane_equation = plane
+                                        self.calculate_vertex_distances()
+                                        # Update GUI status (use threading-safe method)
+                                        if self.gui:
+                                            try:
+                                                self.gui.root.after(0, self.gui.update_status)
+                                            except:
+                                                pass
+                                    else:
+                                        # Show warning in a thread-safe way
+                                        if self.gui:
+                                            self.gui.root.after(0, lambda: messagebox.showwarning("Warning", "Selected points are collinear. Please select 3 non-collinear points."))
+                                        self.selected_vertices.pop()
                             else:
                                 # Update status when vertex is selected
                                 if self.gui:
@@ -1636,6 +1934,21 @@ class OBJPlaneVisualizer:
             if len(self.selected_loops) > 0:
                 self._draw_selected_loops()
             
+            # Draw free-space selection preview line
+            if self.free_space_point1 is not None and self.current_mouse_world_pos is not None:
+                glLineWidth(2.0)
+                glColor3f(0.0, 1.0, 0.0)  # Green color for preview line
+                glBegin(GL_LINES)
+                glVertex3f(self.free_space_point1[0], self.free_space_point1[1], self.free_space_point1[2])
+                glVertex3f(self.current_mouse_world_pos[0], self.current_mouse_world_pos[1], self.current_mouse_world_pos[2])
+                glEnd()
+                # Draw first point marker
+                glPointSize(8.0)
+                glColor3f(0.0, 1.0, 0.0)  # Green
+                glBegin(GL_POINTS)
+                glVertex3f(self.free_space_point1[0], self.free_space_point1[1], self.free_space_point1[2])
+                glEnd()
+            
             # Draw plane if defined
             if self.plane_equation is not None:
                 self._draw_plane()
@@ -1651,7 +1964,11 @@ class OBJPlaneVisualizer:
     
     def _draw_plane(self):
         """Draw the plane as a semi-transparent surface"""
-        if self.plane_equation is None or len(self.selected_vertices) < 3:
+        # Check if we have enough vertices for the current view mode
+        is_orthographic = self.orthographic_view is not None
+        min_vertices = 2 if is_orthographic else 3
+        
+        if self.plane_equation is None or len(self.selected_vertices) < min_vertices:
             return
         
         a, b, c, d = self.plane_equation
@@ -1854,18 +2171,26 @@ class PlaneVisualizerGUI:
         self.status_text = tk.Text(status_frame, height=4, wrap=tk.WORD, state=tk.DISABLED)
         self.status_text.pack(fill=tk.BOTH, expand=True)
         
-        # Distance threshold frame
-        threshold_frame = ttk.LabelFrame(self.root, text="Distance Threshold (OBJ units)", padding="10")
+        # Distance threshold frame (bidirectional)
+        threshold_frame = ttk.LabelFrame(self.root, text="Distance Threshold (OBJ units) - Bidirectional", padding="10")
         threshold_frame.pack(fill=tk.X, padx=10, pady=5)
         
         input_frame = ttk.Frame(threshold_frame)
         input_frame.pack(fill=tk.X)
         
-        ttk.Label(input_frame, text="Distance:").pack(side=tk.LEFT, padx=5)
-        self.distance_var = tk.StringVar(value="1.0")
-        self.distance_entry = ttk.Entry(input_frame, textvariable=self.distance_var, width=15)
-        self.distance_entry.pack(side=tk.LEFT, padx=5)
-        self.distance_entry.bind('<KeyRelease>', self.on_distance_changed)
+        # Positive direction threshold (normal side)
+        ttk.Label(input_frame, text="Positive (normal side):").pack(side=tk.LEFT, padx=5)
+        self.distance_var_positive = tk.StringVar(value="1.0")
+        self.distance_entry_positive = ttk.Entry(input_frame, textvariable=self.distance_var_positive, width=12)
+        self.distance_entry_positive.pack(side=tk.LEFT, padx=5)
+        self.distance_entry_positive.bind('<KeyRelease>', self.on_distance_changed)
+        
+        # Negative direction threshold (opposite to normal)
+        ttk.Label(input_frame, text="Negative (opposite):").pack(side=tk.LEFT, padx=5)
+        self.distance_var_negative = tk.StringVar(value="1.0")
+        self.distance_entry_negative = ttk.Entry(input_frame, textvariable=self.distance_var_negative, width=12)
+        self.distance_entry_negative.pack(side=tk.LEFT, padx=5)
+        self.distance_entry_negative.bind('<KeyRelease>', self.on_distance_changed)
         
         ttk.Label(input_frame, text="units").pack(side=tk.LEFT, padx=5)
         
@@ -1980,24 +2305,42 @@ class PlaneVisualizerGUI:
             status += f"Open edge loops: {len(self.visualizer.edge_loops)}\n"
             status += f"Selected loops: {len(self.visualizer.selected_loops)}\n"
             status += f"Selection mode: {'Edge Loops' if self.visualizer.edge_loop_selection_mode else 'Vertices'}\n"
-            status += f"Selected vertices: {len(self.visualizer.selected_vertices)}/3\n"
+            
+            # Check if in orthographic view (free-space mode) or perspective (vertex mode)
+            is_orthographic = self.visualizer.orthographic_view is not None
+            view_name = self.visualizer.orthographic_view.upper() if is_orthographic else "Perspective"
             
             if self.visualizer.edge_loop_selection_mode:
+                status += f"Selected vertices: {len(self.visualizer.selected_vertices)}/3\n"
                 status += "Click on open edges (magenta) to select loops"
-            elif len(self.visualizer.selected_vertices) == 3:
-                status += f"Vertices within threshold: {len(self.visualizer.vertices_within_threshold)}"
+            elif is_orthographic:
+                # Free-space selection mode for orthographic views
+                status += f"View: {view_name} (Free-space selection)\n"
+                if self.visualizer.free_space_point1 is None:
+                    status += "Click in view to place first point"
+                else:
+                    status += "Click to place second point (or press Escape to cancel)"
             else:
-                status += "Click 3 vertices in 3D view to define plane"
+                # Vertex selection mode for perspective view
+                max_vertices = 3
+                status += f"Selected vertices: {len(self.visualizer.selected_vertices)}/{max_vertices} ({view_name} view)\n"
+                if len(self.visualizer.selected_vertices) == max_vertices:
+                    status += f"Vertices within threshold: {len(self.visualizer.vertices_within_threshold)}"
+                else:
+                    status += "Click 3 vertices in 3D view to define plane"
         
         self.status_text.insert(1.0, status)
         self.status_text.config(state=tk.DISABLED)
     
     def on_distance_changed(self, event=None):
-        """Handle distance threshold change"""
+        """Handle distance threshold change (bidirectional)"""
         try:
-            new_threshold = float(self.distance_var.get())
-            if new_threshold >= 0:
-                self.visualizer.distance_threshold = new_threshold
+            new_threshold_positive = float(self.distance_var_positive.get())
+            new_threshold_negative = float(self.distance_var_negative.get())
+            
+            if new_threshold_positive >= 0 and new_threshold_negative >= 0:
+                self.visualizer.distance_threshold_positive = new_threshold_positive
+                self.visualizer.distance_threshold_negative = new_threshold_negative
                 if self.visualizer.plane_equation is not None:
                     self.visualizer.calculate_vertex_distances()
                     self.visualizer.needs_redraw = True

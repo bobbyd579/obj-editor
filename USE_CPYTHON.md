@@ -35,3 +35,4 @@ Then try activating again.
 
 **Note:** The old PyPy virtual environment (`venv`) is still available if you want to switch back, but CPython (`venv_cpython`) is recommended for this application.
 
+
