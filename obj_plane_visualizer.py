@@ -90,6 +90,12 @@ class OBJPlaneVisualizer:
         self.pending_free_space_click = None  # (x, y, width, height) for screen-space free-space click
         self.pending_mouse_track = None  # (x, y, width, height) for mouse position tracking
         
+        # Connected faces selection state
+        self.connected_faces_mode = False  # Flag for connected faces selection mode
+        self.selected_vertex_for_connection = None  # Vertex index selected for finding connected faces
+        self.connected_face_set = set()  # Set of face indices that are connected
+        self.unconnected_face_set = set()  # Set of face indices that are unconnected (stray)
+        
         # Batch processing state
         self.has_unsaved_changes = False  # Flag to track if current file has been modified
         self.original_vertices = None  # Store original vertices for comparison
@@ -1118,6 +1124,226 @@ class OBJPlaneVisualizer:
         except:
             return None
     
+    def find_connected_faces(self, start_vertex_idx):
+        """Find all faces connected to a starting vertex through shared vertices.
+        
+        Uses BFS to traverse faces connected through shared vertices.
+        Improved algorithm that also considers edge connectivity for better results.
+        
+        Args:
+            start_vertex_idx: Index of the starting vertex
+            
+        Returns:
+            Set of face indices that are connected to the starting vertex
+        """
+        if start_vertex_idx < 0 or start_vertex_idx >= len(self.vertices):
+            return set()
+        
+        if len(self.faces) == 0:
+            return set()
+        
+        # Build vertex-to-faces mapping: for each vertex, list all faces containing it
+        vertex_faces = {}
+        for face_idx, face_data in enumerate(self.faces):
+            # Handle both dictionary and list formats
+            if isinstance(face_data, dict):
+                vertex_indices = face_data.get('vertices', [])
+            else:
+                # Legacy list format: [vertex_indices, texture_indices, normal_indices, format_string]
+                vertex_indices = face_data[0] if len(face_data) > 0 else []
+            
+            if not vertex_indices:  # Skip empty faces
+                continue
+            for vertex_idx in vertex_indices:
+                if 0 <= vertex_idx < len(self.vertices):  # Validate vertex index
+                    if vertex_idx not in vertex_faces:
+                        vertex_faces[vertex_idx] = []
+                    if face_idx not in vertex_faces[vertex_idx]:  # Avoid duplicates
+                        vertex_faces[vertex_idx].append(face_idx)
+        
+        # If starting vertex has no faces, return empty set
+        if start_vertex_idx not in vertex_faces or len(vertex_faces[start_vertex_idx]) == 0:
+            return set()
+        
+        # BFS traversal to find all connected faces
+        connected_faces = set()
+        visited_vertices = {start_vertex_idx}
+        queue = [start_vertex_idx]
+        
+        while queue:
+            current_vertex = queue.pop(0)
+            
+            # Get all faces containing this vertex
+            if current_vertex in vertex_faces:
+                for face_idx in vertex_faces[current_vertex]:
+                    if face_idx not in connected_faces:
+                        connected_faces.add(face_idx)
+                        
+                        # Get all vertices in this face and add unvisited ones to queue
+                        if face_idx < len(self.faces):
+                            face_data = self.faces[face_idx]
+                            # Handle both dictionary and list formats
+                            if isinstance(face_data, dict):
+                                face_vertex_indices = face_data.get('vertices', [])
+                            else:
+                                # Legacy list format
+                                face_vertex_indices = face_data[0] if len(face_data) > 0 else []
+                            
+                            if face_vertex_indices:
+                                for vertex_idx in face_vertex_indices:
+                                    # Validate vertex index and check if not visited
+                                    if 0 <= vertex_idx < len(self.vertices) and vertex_idx not in visited_vertices:
+                                        visited_vertices.add(vertex_idx)
+                                        queue.append(vertex_idx)
+        
+        return connected_faces
+    
+    def delete_unconnected_faces(self):
+        """Delete all unconnected faces (stray parts) and their associated vertices.
+        
+        Deletes vertices that are ONLY used by unconnected faces (not shared with connected faces).
+        Also handles texture coordinates and normals, and remaps vertex indices.
+        
+        Returns:
+            Tuple (deleted_face_count, deleted_vertex_count, remaining_face_count, remaining_vertex_count) or (None, None, None, None) on error
+        """
+        if not self.unconnected_face_set:
+            return None, None, None, None
+        
+        # Collect all vertices used by unconnected faces
+        vertices_in_unconnected = set()
+        for face_idx in self.unconnected_face_set:
+            if face_idx < len(self.faces):
+                face_data = self.faces[face_idx]
+                if isinstance(face_data, dict):
+                    vertex_indices = face_data.get('vertices', [])
+                else:
+                    vertex_indices = face_data[0] if len(face_data) > 0 else []
+                for vertex_idx in vertex_indices:
+                    if 0 <= vertex_idx < len(self.vertices):
+                        vertices_in_unconnected.add(vertex_idx)
+        
+        # Collect all vertices used by connected faces
+        vertices_in_connected = set()
+        for face_idx in self.connected_face_set:
+            if face_idx < len(self.faces):
+                face_data = self.faces[face_idx]
+                if isinstance(face_data, dict):
+                    vertex_indices = face_data.get('vertices', [])
+                else:
+                    vertex_indices = face_data[0] if len(face_data) > 0 else []
+                for vertex_idx in vertex_indices:
+                    if 0 <= vertex_idx < len(self.vertices):
+                        vertices_in_connected.add(vertex_idx)
+        
+        # Vertices to delete: only those in unconnected faces but NOT in connected faces
+        vertices_to_delete = vertices_in_unconnected - vertices_in_connected
+        
+        # Remove unconnected faces
+        new_faces = []
+        for face_idx, face_data in enumerate(self.faces):
+            if face_idx not in self.unconnected_face_set:
+                new_faces.append(face_data)
+        
+        deleted_face_count = len(self.faces) - len(new_faces)
+        self.faces = new_faces
+        
+        # Create mapping from old vertex index to new index
+        # Only keep vertices that are NOT being deleted
+        old_to_new_vertex = {}
+        new_vertices = []
+        new_index = 0
+        
+        for old_index in range(len(self.vertices)):
+            if old_index not in vertices_to_delete:
+                old_to_new_vertex[old_index] = new_index
+                new_vertices.append(self.vertices[old_index])
+                new_index += 1
+        
+        # Update vertices
+        self.vertices = np.array(new_vertices) if new_vertices else np.array([])
+        
+        # Update face vertex indices using the mapping
+        # Remove faces that have no valid vertices after deletion
+        faces_to_remove = []
+        for face_idx, face in enumerate(self.faces):
+            new_vertex_indices = []
+            new_texture_indices = []
+            new_normal_indices = []
+            new_format = []
+            
+            # Handle both dictionary and list formats
+            if isinstance(face, dict):
+                face_vertex_indices = face.get('vertices', [])
+                face_texture_indices = face.get('textures', [])
+                face_normal_indices = face.get('normals', [])
+                face_format = face.get('format', [])
+            else:
+                face_vertex_indices = face[0] if len(face) > 0 else []
+                face_texture_indices = face[1] if len(face) > 1 else []
+                face_normal_indices = face[2] if len(face) > 2 else []
+                face_format = face[3] if len(face) > 3 else []
+            
+            for i, v_idx in enumerate(face_vertex_indices):
+                if v_idx in old_to_new_vertex:
+                    new_vertex_indices.append(old_to_new_vertex[v_idx])
+                    if i < len(face_texture_indices):
+                        new_texture_indices.append(face_texture_indices[i])
+                    if i < len(face_normal_indices):
+                        new_normal_indices.append(face_normal_indices[i])
+                    # Reconstruct format string with new vertex index
+                    if i < len(face_format):
+                        orig_format = face_format[i]
+                        parts = orig_format.split('/')
+                        if len(parts) > 0:
+                            parts[0] = str(old_to_new_vertex[v_idx] + 1)  # OBJ is 1-indexed
+                            new_format.append('/'.join(parts))
+                        else:
+                            new_format.append(str(old_to_new_vertex[v_idx] + 1))
+            
+            # If face has less than 3 vertices after deletion, mark for removal
+            if len(new_vertex_indices) < 3:
+                faces_to_remove.append(face_idx)
+            else:
+                # Update face data
+                if isinstance(face, dict):
+                    face['vertices'] = new_vertex_indices
+                    face['textures'] = new_texture_indices
+                    face['normals'] = new_normal_indices
+                    face['format'] = new_format
+                else:
+                    # Legacy list format
+                    face[0] = new_vertex_indices
+                    face[1] = new_texture_indices
+                    face[2] = new_normal_indices
+                    face[3] = new_format
+        
+        # Remove invalid faces (in reverse order)
+        for face_idx in reversed(faces_to_remove):
+            self.faces.pop(face_idx)
+        
+        deleted_vertex_count = len(vertices_to_delete)
+        remaining_face_count = len(self.faces)
+        remaining_vertex_count = len(self.vertices)
+        
+        # Recalculate bounding box
+        if len(self.vertices) > 0:
+            self.calculate_bounding_box()
+        
+        # Rebuild open edges and edge loops after deletion
+        self.detect_open_edges()
+        self.find_edge_loops()
+        
+        # Clear connected faces state
+        self.connected_face_set = set()
+        self.unconnected_face_set = set()
+        self.selected_vertex_for_connection = None
+        
+        # Mark as changed
+        self.mark_as_changed()
+        
+        return deleted_face_count, deleted_vertex_count, remaining_face_count, remaining_vertex_count
+    
     def calculate_vertex_distances(self):
         """Calculate signed distance from each vertex to the plane"""
         if self.plane_equation is None:
@@ -1248,9 +1474,34 @@ class OBJPlaneVisualizer:
             messagebox.showerror("Error", "Failed to initialize GLFW")
             return
         
-        # Use saved window size and position if available
-        window_width = self.saved_window_width if self.saved_window_width else 1024
-        window_height = self.saved_window_height if self.saved_window_height else 768
+        # Get screen dimensions for OpenGL window (half width, full height on right side)
+        # Try to get from GUI if available, otherwise use defaults
+        if self.gui and hasattr(self.gui, 'screen_width'):
+            screen_width = self.gui.screen_width
+            screen_height = self.gui.screen_height
+        else:
+            # Fallback: get from GLFW or use defaults
+            try:
+                # Get primary monitor (glfw is already imported at module level)
+                monitor = glfw.get_primary_monitor()
+                if monitor:
+                    video_mode = glfw.get_video_mode(monitor)
+                    screen_width = video_mode.size.width
+                    screen_height = video_mode.size.height
+                else:
+                    screen_width = 1920
+                    screen_height = 1080
+            except:
+                screen_width = 1920
+                screen_height = 1080
+        
+        # Calculate OpenGL window size: half screen width, full height
+        window_width = screen_width // 2
+        window_height = screen_height
+        
+        # Position on right half of screen
+        window_x = screen_width // 2
+        window_y = 0
         
         window = glfw.create_window(window_width, window_height, "OBJ Plane Visualizer - Click 3 vertices to define plane", None, None)
         if not window:
@@ -1258,9 +1509,14 @@ class OBJPlaneVisualizer:
             messagebox.showerror("Error", "Failed to create GLFW window")
             return
         
-        # Set window position if we have saved position
-        if self.saved_window_x is not None and self.saved_window_y is not None:
-            glfw.set_window_pos(window, self.saved_window_x, self.saved_window_y)
+        # Set window position to right half of screen
+        glfw.set_window_pos(window, window_x, window_y)
+        
+        # Update saved dimensions
+        self.saved_window_width = window_width
+        self.saved_window_height = window_height
+        self.saved_window_x = window_x
+        self.saved_window_y = window_y
         
         glfw.make_context_current(window)
         self.opengl_window = window
@@ -1827,6 +2083,31 @@ class OBJPlaneVisualizer:
                 nearest = self.find_nearest_vertex_screen_space(click_x, click_y, click_width, click_height)
                 
                 if nearest is not None:
+                    # Check if we're in connected faces mode
+                    if self.connected_faces_mode:
+                        # Connected faces selection mode
+                        self.selected_vertex_for_connection = nearest
+                        self.connected_face_set = self.find_connected_faces(nearest)
+                        
+                        # Calculate unconnected faces (all faces not in connected set)
+                        all_face_indices = set(range(len(self.faces)))
+                        self.unconnected_face_set = all_face_indices - self.connected_face_set
+                        
+                        # Debug output
+                        print(f"DEBUG: Selected vertex: {nearest}")
+                        print(f"DEBUG: Connected faces: {len(self.connected_face_set)}")
+                        print(f"DEBUG: Unconnected faces: {len(self.unconnected_face_set)}")
+                        print(f"DEBUG: Total faces: {len(self.faces)}")
+                        
+                        self.needs_redraw = True
+                        # Update GUI status
+                        if self.gui:
+                            try:
+                                self.gui.root.after(0, self.gui.update_status)
+                            except:
+                                pass
+                        continue  # Skip normal vertex selection logic
+                    
                     # Check if we're in orthographic view (2-point mode) or perspective view (3-point mode)
                     is_orthographic = self.orthographic_view is not None
                     max_vertices = 2 if is_orthographic else 3
@@ -1948,6 +2229,112 @@ class OBJPlaneVisualizer:
                 glBegin(GL_POINTS)
                 glVertex3f(self.free_space_point1[0], self.free_space_point1[1], self.free_space_point1[2])
                 glEnd()
+            
+            # Draw connected faces highlight (main body) - draw first so unconnected appears on top
+            if self.connected_faces_mode and self.connected_face_set:
+                glEnable(GL_BLEND)
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+                glColor4f(0.0, 0.8, 0.0, 0.4)  # Green with transparency for connected faces
+                glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
+                
+                for face_idx in self.connected_face_set:
+                    if face_idx < len(self.faces):
+                        face_data = self.faces[face_idx]
+                        # Handle both dictionary and list formats
+                        if isinstance(face_data, dict):
+                            vertex_indices = face_data.get('vertices', [])
+                        else:
+                            vertex_indices = face_data[0] if len(face_data) > 0 else []
+                        
+                        if vertex_indices and len(vertex_indices) >= 3:
+                            glBegin(GL_POLYGON)
+                            for vertex_idx in vertex_indices:
+                                if 0 <= vertex_idx < len(self.vertices):
+                                    v = self.vertices[vertex_idx]
+                                    glVertex3f(v[0], v[1], v[2])
+                            glEnd()
+                
+                # Draw wireframe outline for connected faces
+                glLineWidth(2.0)
+                glColor3f(0.0, 1.0, 0.0)  # Bright green
+                glPolygonMode(GL_FRONT_AND_BACK, GL_LINE)
+                for face_idx in self.connected_face_set:
+                    if face_idx < len(self.faces):
+                        face_data = self.faces[face_idx]
+                        # Handle both dictionary and list formats
+                        if isinstance(face_data, dict):
+                            vertex_indices = face_data.get('vertices', [])
+                        else:
+                            vertex_indices = face_data[0] if len(face_data) > 0 else []
+                        
+                        if vertex_indices and len(vertex_indices) >= 3:
+                            glBegin(GL_LINE_LOOP)
+                            for vertex_idx in vertex_indices:
+                                if 0 <= vertex_idx < len(self.vertices):
+                                    v = self.vertices[vertex_idx]
+                                    glVertex3f(v[0], v[1], v[2])
+                            glEnd()
+                
+                glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
+                glDisable(GL_BLEND)
+            
+            # Draw selected vertex marker (larger and brighter)
+            if self.connected_faces_mode and self.selected_vertex_for_connection is not None:
+                if 0 <= self.selected_vertex_for_connection < len(self.vertices):
+                    glPointSize(12.0)
+                    glColor3f(0.0, 1.0, 1.0)  # Cyan for selected vertex
+                    glBegin(GL_POINTS)
+                    v = self.vertices[self.selected_vertex_for_connection]
+                    glVertex3f(v[0], v[1], v[2])
+                    glEnd()
+            
+            # Draw unconnected faces highlight (stray parts) - draw on top
+            if self.connected_faces_mode and self.unconnected_face_set:
+                glEnable(GL_BLEND)
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+                glColor4f(1.0, 0.3, 0.0, 0.6)  # Orange with more opacity for visibility
+                glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
+                
+                for face_idx in self.unconnected_face_set:
+                    if face_idx < len(self.faces):
+                        face_data = self.faces[face_idx]
+                        # Handle both dictionary and list formats
+                        if isinstance(face_data, dict):
+                            vertex_indices = face_data.get('vertices', [])
+                        else:
+                            vertex_indices = face_data[0] if len(face_data) > 0 else []
+                        
+                        if vertex_indices and len(vertex_indices) >= 3:
+                            glBegin(GL_POLYGON)
+                            for vertex_idx in vertex_indices:
+                                if 0 <= vertex_idx < len(self.vertices):
+                                    v = self.vertices[vertex_idx]
+                                    glVertex3f(v[0], v[1], v[2])
+                            glEnd()
+                
+                # Also draw wireframe outline
+                glLineWidth(3.0)  # Thicker for better visibility
+                glColor3f(1.0, 0.2, 0.0)  # Darker orange
+                glPolygonMode(GL_FRONT_AND_BACK, GL_LINE)
+                for face_idx in self.unconnected_face_set:
+                    if face_idx < len(self.faces):
+                        face_data = self.faces[face_idx]
+                        # Handle both dictionary and list formats
+                        if isinstance(face_data, dict):
+                            vertex_indices = face_data.get('vertices', [])
+                        else:
+                            vertex_indices = face_data[0] if len(face_data) > 0 else []
+                        
+                        if vertex_indices and len(vertex_indices) >= 3:
+                            glBegin(GL_LINE_LOOP)
+                            for vertex_idx in vertex_indices:
+                                if 0 <= vertex_idx < len(self.vertices):
+                                    v = self.vertices[vertex_idx]
+                                    glVertex3f(v[0], v[1], v[2])
+                            glEnd()
+                
+                glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
+                glDisable(GL_BLEND)
             
             # Draw plane if defined
             if self.plane_equation is not None:
@@ -2118,7 +2505,17 @@ class PlaneVisualizerGUI:
         self.visualizer.gui = self  # Reference to GUI for updates
         self.root = tk.Tk()
         self.root.title("OBJ Plane Distance Visualizer")
-        self.root.geometry("800x600")
+        
+        # Get screen dimensions and set window to half width, full height on left side
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        window_width = screen_width // 2
+        window_height = screen_height
+        self.root.geometry(f"{window_width}x{window_height}+0+0")
+        
+        # Store screen dimensions for OpenGL window
+        self.screen_width = screen_width
+        self.screen_height = screen_height
         
         # Store initial size for restoration if needed
         self.initial_geometry = "400x350"
@@ -2127,6 +2524,10 @@ class PlaneVisualizerGUI:
         self.batch_folder_path = None
         self.file_listbox = None
         self.file_list_scrollbar = None
+        
+        # Suffix input for file naming
+        self.suffix_var = tk.StringVar(value="")
+        self.suffix_entry = None
         
         self.setup_ui()
     
@@ -2163,6 +2564,15 @@ class PlaneVisualizerGUI:
         self.file_label.pack(side=tk.LEFT, padx=5, expand=True)
         
         ttk.Button(file_frame, text="Load OBJ", command=self.load_obj).pack(side=tk.RIGHT, padx=5)
+        
+        # Suffix input frame
+        suffix_frame = ttk.Frame(self.root, padding="10")
+        suffix_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        ttk.Label(suffix_frame, text="File Suffix:").pack(side=tk.LEFT, padx=5)
+        self.suffix_entry = ttk.Entry(suffix_frame, textvariable=self.suffix_var, width=20)
+        self.suffix_entry.pack(side=tk.LEFT, padx=5)
+        ttk.Label(suffix_frame, text="(empty = overwrite original file)").pack(side=tk.LEFT, padx=5)
         
         # Status frame
         status_frame = ttk.LabelFrame(self.root, text="Status", padding="10")
@@ -2221,6 +2631,27 @@ class PlaneVisualizerGUI:
             command=self.toggle_selection_mode
         )
         self.selection_mode_button.pack(side=tk.LEFT, padx=5)
+        
+        # Connected faces selection frame
+        connected_faces_frame = ttk.LabelFrame(self.root, text="Connected Faces Selection", padding="10")
+        connected_faces_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        self.connected_faces_mode_button = ttk.Button(
+            connected_faces_frame,
+            text="Select Connected Faces Mode",
+            command=self.toggle_connected_faces_mode
+        )
+        self.connected_faces_mode_button.pack(side=tk.LEFT, padx=5)
+        
+        self.delete_unconnected_button = ttk.Button(
+            connected_faces_frame,
+            text="Delete Unconnected Faces",
+            command=self.delete_unconnected_faces
+        )
+        self.delete_unconnected_button.pack(side=tk.LEFT, padx=5)
+        
+        self.connected_faces_status_label = ttk.Label(connected_faces_frame, text="Mode: Off")
+        self.connected_faces_status_label.pack(side=tk.LEFT, padx=10)
         
         # Edge loop flattening frame
         flatten_frame = ttk.LabelFrame(self.root, text="Flatten Selected Loops", padding="10")
@@ -2305,6 +2736,20 @@ class PlaneVisualizerGUI:
             status += f"Open edge loops: {len(self.visualizer.edge_loops)}\n"
             status += f"Selected loops: {len(self.visualizer.selected_loops)}\n"
             status += f"Selection mode: {'Edge Loops' if self.visualizer.edge_loop_selection_mode else 'Vertices'}\n"
+            
+            # Connected faces mode status
+            if self.visualizer.connected_faces_mode:
+                status += f"Connected Faces Mode: ON\n"
+                if self.visualizer.selected_vertex_for_connection is not None:
+                    status += f"Selected vertex: {self.visualizer.selected_vertex_for_connection}\n"
+                    status += f"Connected faces: {len(self.visualizer.connected_face_set)} (highlighted in GREEN)\n"
+                    status += f"Unconnected faces: {len(self.visualizer.unconnected_face_set)} (highlighted in ORANGE)\n"
+                    if len(self.visualizer.connected_face_set) == 0:
+                        status += "WARNING: No connected faces found! Try a different vertex.\n"
+                    elif len(self.visualizer.unconnected_face_set) == 0:
+                        status += "All faces are connected - no stray parts detected.\n"
+                else:
+                    status += "Click a vertex on the main body to find connected faces\n"
             
             # Check if in orthographic view (free-space mode) or perspective (vertex mode)
             is_orthographic = self.visualizer.orthographic_view is not None
@@ -2545,6 +2990,59 @@ class PlaneVisualizerGUI:
         
         self.update_status()
     
+    def toggle_connected_faces_mode(self):
+        """Toggle connected faces selection mode"""
+        self.visualizer.connected_faces_mode = not self.visualizer.connected_faces_mode
+        
+        if self.visualizer.connected_faces_mode:
+            self.connected_faces_mode_button.config(text="Connected Faces Mode (Active)")
+            self.connected_faces_status_label.config(text="Mode: On - Click a vertex on the main body")
+            # Clear previous selection
+            self.visualizer.connected_face_set = set()
+            self.visualizer.unconnected_face_set = set()
+            self.visualizer.selected_vertex_for_connection = None
+        else:
+            self.connected_faces_mode_button.config(text="Select Connected Faces Mode")
+            self.connected_faces_status_label.config(text="Mode: Off")
+            # Clear selection
+            self.visualizer.connected_face_set = set()
+            self.visualizer.unconnected_face_set = set()
+            self.visualizer.selected_vertex_for_connection = None
+        
+        self.visualizer.needs_redraw = True
+        self.update_status()
+    
+    def delete_unconnected_faces(self):
+        """Delete unconnected faces (stray parts) and their vertices"""
+        if not self.visualizer.unconnected_face_set:
+            messagebox.showwarning("Warning", "No unconnected faces selected.\nPlease select a vertex on the main body first.")
+            return
+        
+        unconnected_count = len(self.visualizer.unconnected_face_set)
+        response = messagebox.askyesno(
+            "Delete Unconnected Faces?",
+            f"This will delete {unconnected_count} unconnected face(s) and all associated vertices (stray parts).\n\nProceed?"
+        )
+        
+        if not response:
+            return
+        
+        deleted_face_count, deleted_vertex_count, remaining_face_count, remaining_vertex_count = self.visualizer.delete_unconnected_faces()
+        
+        if deleted_face_count is None:
+            messagebox.showerror("Error", "Failed to delete unconnected faces")
+            return
+        
+        messagebox.showinfo(
+            "Success", 
+            f"Deleted {deleted_face_count} unconnected face(s) and {deleted_vertex_count} vertex/vertices.\n"
+            f"Remaining: {remaining_face_count} face(s), {remaining_vertex_count} vertex/vertices"
+        )
+        
+        # Update visualization
+        self.visualizer.needs_redraw = True
+        self.update_status()
+    
     def delete_vertices(self):
         """Delete all vertices within the plane threshold and save to new file"""
         if not self.visualizer.vertices_within_threshold:
@@ -2622,34 +3120,33 @@ class PlaneVisualizerGUI:
             if not response:
                 return False
         
+        # Get suffix value
+        suffix = self.suffix_var.get().strip()
+        
         # Determine output path
-        if use_edit_prefix:
+        if suffix:
+            # Suffix provided - create new file with suffix
+            base_name = os.path.splitext(os.path.basename(self.visualizer.obj_path))[0]
+            dir_name = os.path.dirname(self.visualizer.obj_path)
+            output_path = os.path.join(dir_name, f"{base_name}{suffix}.obj")
+        elif use_edit_prefix:
             # Save with "_edit" prefix in same directory as original
             base_name = os.path.splitext(os.path.basename(self.visualizer.obj_path))[0]
             dir_name = os.path.dirname(self.visualizer.obj_path)
             output_path = os.path.join(dir_name, f"{base_name}_edit.obj")
         else:
-            # Ask for output file location
-            root = tk.Tk()
-            root.withdraw()
+            # No suffix - assume overwrite of original file
+            output_path = self.visualizer.obj_path
             
-            # Suggest output filename
-            base_name = os.path.splitext(os.path.basename(self.visualizer.obj_path))[0]
-            dir_name = os.path.dirname(self.visualizer.obj_path)
-            default_name = os.path.join(dir_name, f"{base_name}_edited.obj")
-            
-            output_path = filedialog.asksaveasfilename(
-                title="Save OBJ file",
-                defaultextension=".obj",
-                filetypes=[("OBJ files", "*.obj"), ("All files", "*.*")],
-                initialfile=os.path.basename(default_name),
-                initialdir=os.path.dirname(default_name) if os.path.dirname(default_name) else "."
-            )
-            
-            root.destroy()
-            
-            if not output_path:
-                return False
+            # Check if file exists and ask for confirmation
+            if os.path.exists(output_path):
+                response = messagebox.askyesnocancel(
+                    "Overwrite File?",
+                    f"Overwrite existing file?\n{os.path.basename(output_path)}\n\nYes = Overwrite\nNo = Cancel save\nCancel = Cancel"
+                )
+                if response is None or response is False:  # Cancel or No
+                    return False
+                # response is True means proceed with overwrite
         
         # Write the OBJ file
         if self.visualizer.write_obj_file(output_path):
