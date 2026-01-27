@@ -21,8 +21,10 @@ except (ImportError, AttributeError, OSError):
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+import json
 import numpy as np
 import os
+import re
 import shutil
 from pathlib import Path
 import threading
@@ -67,6 +69,24 @@ class OBJScaler:
         self.saved_window_y = None  # Saved window Y position
         self.saved_window_width = 1024  # Default window width
         self.saved_window_height = 768  # Default window height
+        
+        # View and orthographic state (set from GUI, read by OpenGL loop)
+        self.view_xy_flag = False
+        self.view_yz_flag = False
+        self.view_xz_flag = False
+        self.reset_view_flag = False
+        self.orthographic_view = None  # None | 'xy' | 'yz' | 'xz'
+        
+        # Distance measurement state (ortho views only)
+        self.measure_mode = False
+        self.measure_point1 = None  # [x,y,z] or None
+        self.measure_point2 = None  # [x,y,z] or None; during drag = current mouse world
+        self.measure_dragging = False
+        self.pending_measure_click = None  # (x_fb, y_fb, width, height) or None
+        self.pending_measure_track = None  # (x_fb, y_fb, width, height) or None
+        
+        # Global scale adjustment (applies before any scale; 1.0 = no change)
+        self.adjustment = 1.0
         
     def select_obj_file(self):
         """Use tkinter to select OBJ file"""
@@ -197,6 +217,91 @@ class OBJScaler:
         ])
         return corners
     
+    def get_adjusted_vertices(self):
+        """Vertices scaled by adjustment around bbox_center. If adjustment==1.0, return originals."""
+        if self.extents is None or len(self.vertices) == 0:
+            return self.vertices
+        if self.adjustment == 1.0:
+            return self.vertices
+        adj = (self.vertices - self.bbox_center) * self.adjustment + self.bbox_center
+        return adj
+    
+    def get_adjusted_extents(self):
+        """Extents scaled by adjustment."""
+        if self.extents is None:
+            return None
+        return self.extents * self.adjustment
+    
+    def get_adjusted_bbox_center(self):
+        """Bbox center (unchanged by adjustment)."""
+        return self.bbox_center
+    
+    def get_adjusted_bbox_min(self):
+        """Bbox min for adjusted geometry."""
+        if self.extents is None or self.bbox_center is None:
+            return self.bbox_min
+        return self.bbox_center - (self.extents * 0.5) * self.adjustment
+    
+    def get_adjusted_bbox_max(self):
+        """Bbox max for adjusted geometry."""
+        if self.extents is None or self.bbox_center is None:
+            return self.bbox_max
+        return self.bbox_center + (self.extents * 0.5) * self.adjustment
+    
+    def get_adjusted_corners(self):
+        """Eight corners of adjusted bounding box."""
+        if self.extents is None:
+            return self.get_bounding_box_corners()
+        mn = self.get_adjusted_bbox_min()
+        mx = self.get_adjusted_bbox_max()
+        min_x, min_y, min_z = mn
+        max_x, max_y, max_z = mx
+        corners = np.array([
+            [min_x, min_y, min_z],
+            [max_x, min_y, min_z],
+            [max_x, max_y, min_z],
+            [min_x, max_y, min_z],
+            [min_x, min_y, max_z],
+            [max_x, min_y, max_z],
+            [max_x, max_y, max_z],
+            [min_x, max_y, max_z],
+        ])
+        return corners
+    
+    def screen_to_world_on_view_plane(self, mouse_x, mouse_y, width, height, view_type):
+        """Convert screen coordinates to world coordinates on the view plane.
+        
+        Uses gluUnProject. For XY: projects to z=0; YZ: x=0; XZ: y=0.
+        Call from render loop after projection/modelview are set.
+        """
+        import ctypes
+        from OpenGL.GL import glGetDoublev, glGetIntegerv, GL_MODELVIEW_MATRIX, GL_PROJECTION_MATRIX, GL_VIEWPORT
+        from OpenGL.GLU import gluUnProject
+        
+        modelview = (ctypes.c_double * 16)()
+        projection = (ctypes.c_double * 16)()
+        viewport = (ctypes.c_int * 4)()
+        glGetDoublev(GL_MODELVIEW_MATRIX, modelview)
+        glGetDoublev(GL_PROJECTION_MATRIX, projection)
+        glGetIntegerv(GL_VIEWPORT, viewport)
+        win_y = height - mouse_y
+        win_z = 0.5
+        try:
+            result = gluUnProject(mouse_x, win_y, win_z, modelview, projection, viewport)
+            if result is not None:
+                obj_x, obj_y, obj_z = result
+                world_point = np.array([float(obj_x), float(obj_y), float(obj_z)])
+                if view_type == 'xy':
+                    world_point[2] = 0.0
+                elif view_type == 'yz':
+                    world_point[0] = 0.0
+                elif view_type == 'xz':
+                    world_point[1] = 0.0
+                return world_point
+        except Exception:
+            pass
+        return None
+    
     def visualize_bounding_box(self):
         """Display 3D visualization with OBJ and bounding box using PyOpenGL"""
         if not OPENGL_AVAILABLE:
@@ -245,8 +350,9 @@ class OBJScaler:
         glfw.set_window_pos_callback(window, window_pos_callback)
         glfw.set_window_size_callback(window, window_size_callback)
         
-        # Update window title with dimensions
-        dim_text = f"OBJ Model - BBox: X={self.extents[0]:.2f} Y={self.extents[1]:.2f} Z={self.extents[2]:.2f}"
+        # Update window title with dimensions (use adjusted extents)
+        adj_ext = self.get_adjusted_extents()
+        dim_text = f"OBJ Model - BBox: X={adj_ext[0]:.2f} Y={adj_ext[1]:.2f} Z={adj_ext[2]:.2f}" if adj_ext is not None else "OBJ Model"
         glfw.set_window_title(window, dim_text)
         
         # OpenGL settings
@@ -255,45 +361,111 @@ class OBJScaler:
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         glClearColor(1.0, 1.0, 1.0, 1.0)  # White background
         
-        # Camera settings
-        camera_distance = np.max(self.extents) * 2.5
-        camera_x = self.bbox_center[0]
-        camera_y = self.bbox_center[1]
-        camera_z = self.bbox_center[2] + camera_distance
+        # Initial camera (for reset); use adjusted extents
+        _ext = adj_ext if adj_ext is not None else self.extents
+        _max = np.max(_ext) * 2.5 if _ext is not None else 1.0
+        initial_camera_distance = _max
+        initial_camera_x = self.bbox_center[0]
+        initial_camera_y = self.bbox_center[1]
+        initial_camera_z = self.bbox_center[2] + initial_camera_distance
         
+        camera_distance = initial_camera_distance
+        camera_x = initial_camera_x
+        camera_y = initial_camera_y
+        camera_z = initial_camera_z
         rotation_x = 0.0
         rotation_y = 0.0
         zoom = 1.0
+        pan_x = 0.0
+        pan_y = 0.0
         
         # Mouse state
         last_x, last_y = 0, 0
         mouse_down = False
+        mouse_button = None
+        click_start_x, click_start_y = 0, 0
+        mouse_has_moved = False
         
-        def mouse_button_callback(window, button, action, mods):
-            nonlocal mouse_down
-            if button == glfw.MOUSE_BUTTON_LEFT:
-                mouse_down = (action == glfw.PRESS)
+        def window_to_framebuffer_coords(window, xpos, ypos):
+            width, height = glfw.get_framebuffer_size(window)
+            ww, wh = glfw.get_window_size(window)
+            if ww > 0 and wh > 0:
+                return xpos * (width / ww), ypos * (height / wh), width, height
+            return xpos, ypos, width, height
         
-        def cursor_pos_callback(window, xpos, ypos):
-            nonlocal last_x, last_y, rotation_x, rotation_y
-            if mouse_down:
-                dx = xpos - last_x
-                dy = ypos - last_y
-                rotation_y += dx * 0.5
-                rotation_x += dy * 0.5
+        def mouse_button_callback(win, button, action, mods):
+            nonlocal mouse_down, mouse_button, click_start_x, click_start_y, mouse_has_moved, last_x, last_y
+            if action == glfw.PRESS:
+                mouse_down = True
+                mouse_button = button
+                mouse_has_moved = False
+                click_start_x, click_start_y = glfw.get_cursor_pos(win)
+                last_x, last_y = click_start_x, click_start_y
+                if button == glfw.MOUSE_BUTTON_LEFT and self.measure_mode and self.orthographic_view is not None:
+                    xpos_fb, ypos_fb, w, h = window_to_framebuffer_coords(win, click_start_x, click_start_y)
+                    if self.measure_point1 is not None and self.measure_point2 is not None:
+                        self.measure_point1 = None
+                        self.measure_point2 = None
+                    self.pending_measure_click = (xpos_fb, ypos_fb, w, h)
+            elif action == glfw.RELEASE:
+                mouse_down = False
+                mouse_button = None
+                mouse_has_moved = False
+                if button == glfw.MOUSE_BUTTON_LEFT:
+                    self.measure_dragging = False
+        
+        def cursor_pos_callback(win, xpos, ypos):
+            nonlocal last_x, last_y, rotation_x, rotation_y, pan_x, pan_y, mouse_has_moved, click_start_x, click_start_y
+            measuring = (self.measure_mode and self.orthographic_view is not None and
+                        self.measure_point1 is not None and mouse_down and mouse_button == glfw.MOUSE_BUTTON_LEFT)
+            if measuring:
+                xpos_fb, ypos_fb, w, h = window_to_framebuffer_coords(win, xpos, ypos)
+                self.pending_measure_track = (xpos_fb, ypos_fb, w, h)
+            elif mouse_down:
+                if not mouse_has_moved:
+                    dist = np.sqrt((xpos - click_start_x)**2 + (ypos - click_start_y)**2)
+                    if dist > 5.0:
+                        mouse_has_moved = True
+                        if mouse_button == glfw.MOUSE_BUTTON_LEFT and not (self.measure_mode and self.orthographic_view is not None):
+                            self.pending_measure_click = None
+                if mouse_has_moved:
+                    dx = xpos - last_x
+                    dy = ypos - last_y
+                    if abs(dx) > 0.1 or abs(dy) > 0.1:
+                        adj_e = self.get_adjusted_extents()
+                        model_size = np.max(adj_e) if adj_e is not None else 1.0
+                        pan_speed = (model_size * 0.001) * zoom
+                        if mouse_button == glfw.MOUSE_BUTTON_RIGHT or \
+                           (mouse_button == glfw.MOUSE_BUTTON_LEFT and glfw.get_key(win, glfw.KEY_LEFT_SHIFT) == glfw.PRESS):
+                            pan_x += dx * pan_speed
+                            pan_y -= dy * pan_speed
+                        elif mouse_button == glfw.MOUSE_BUTTON_LEFT and self.orthographic_view is None:
+                            rotation_y += dx * 0.5
+                            rotation_x += dy * 0.5
             last_x, last_y = xpos, ypos
         
-        def scroll_callback(window, xoffset, yoffset):
+        def scroll_callback(win, xoffset, yoffset):
             nonlocal zoom
-            zoom += yoffset * 0.1
-            zoom = max(0.1, min(5.0, zoom))
+            if yoffset != 0:
+                zoom_factor = 1.15 if yoffset > 0 else 1.0 / 1.15
+                zoom *= zoom_factor
+                zoom = max(0.05, min(20.0, zoom))
+        
+        def key_callback(win, key, scancode, action, mods):
+            if action == glfw.PRESS and key == glfw.KEY_ESCAPE:
+                if self.measure_mode and (self.measure_point1 is not None or self.measure_point2 is not None):
+                    self.measure_point1 = None
+                    self.measure_point2 = None
+                    self.measure_dragging = False
+                    self.pending_measure_click = None
+                    self.pending_measure_track = None
         
         glfw.set_mouse_button_callback(window, mouse_button_callback)
         glfw.set_cursor_pos_callback(window, cursor_pos_callback)
         glfw.set_scroll_callback(window, scroll_callback)
+        glfw.set_key_callback(window, key_callback)
         
-        # Get bounding box corners
-        corners = self.get_bounding_box_corners()
+        # Bbox edges (indices into corners)
         edges = [
             [0, 1], [1, 2], [2, 3], [3, 0],  # Bottom face
             [4, 5], [5, 6], [6, 7], [7, 4],  # Top face
@@ -304,46 +476,176 @@ class OBJScaler:
         while not glfw.window_should_close(window):
             glfw.poll_events()
             
+            # Reset view
+            if self.reset_view_flag:
+                rotation_x = 0.0
+                rotation_y = 0.0
+                zoom = 1.0
+                pan_x = 0.0
+                pan_y = 0.0
+                camera_distance = initial_camera_distance
+                camera_x = initial_camera_x
+                camera_y = initial_camera_y
+                camera_z = initial_camera_z
+                self.orthographic_view = None
+                self.measure_point1 = None
+                self.measure_point2 = None
+                self.measure_dragging = False
+                self.pending_measure_click = None
+                self.pending_measure_track = None
+                self.reset_view_flag = False
+            
+            # View XY
+            if self.view_xy_flag:
+                rotation_x = 0.0
+                rotation_y = 0.0
+                zoom = 1.0
+                pan_x = 0.0
+                pan_y = 0.0
+                camera_distance = initial_camera_distance
+                self.orthographic_view = 'xy'
+                self.measure_point1 = None
+                self.measure_point2 = None
+                self.measure_dragging = False
+                self.pending_measure_click = None
+                self.pending_measure_track = None
+                self.view_xy_flag = False
+            
+            # View YZ
+            if self.view_yz_flag:
+                rotation_x = 0.0
+                rotation_y = 0.0
+                zoom = 1.0
+                pan_x = 0.0
+                pan_y = 0.0
+                camera_distance = initial_camera_distance
+                self.orthographic_view = 'yz'
+                self.measure_point1 = None
+                self.measure_point2 = None
+                self.measure_dragging = False
+                self.pending_measure_click = None
+                self.pending_measure_track = None
+                self.view_yz_flag = False
+            
+            # View XZ
+            if self.view_xz_flag:
+                rotation_x = 0.0
+                rotation_y = 0.0
+                zoom = 1.0
+                pan_x = 0.0
+                pan_y = 0.0
+                camera_distance = initial_camera_distance
+                self.orthographic_view = 'xz'
+                self.measure_point1 = None
+                self.measure_point2 = None
+                self.measure_dragging = False
+                self.pending_measure_click = None
+                self.pending_measure_track = None
+                self.view_xz_flag = False
+            
             # Clear
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
             
-            # Set up projection
             width, height = glfw.get_framebuffer_size(window)
             glViewport(0, 0, width, height)
+            aspect = width / height if height > 0 else 1.0
             
+            # Projection: ortho vs perspective
             glMatrixMode(GL_PROJECTION)
             glLoadIdentity()
-            aspect = width / height if height > 0 else 1.0
-            gluPerspective(45.0, aspect, 0.1, camera_distance * 10)
+            if self.orthographic_view is not None:
+                adj_e = self.get_adjusted_extents()
+                max_extent = np.max(adj_e) if adj_e is not None else 1.0
+                ortho_size = max_extent * 1.2 / zoom
+                if aspect >= 1.0:
+                    left, right = -ortho_size * aspect, ortho_size * aspect
+                    bottom, top = -ortho_size, ortho_size
+                else:
+                    left, right = -ortho_size, ortho_size
+                    bottom, top = -ortho_size / aspect, ortho_size / aspect
+                glOrtho(left, right, bottom, top, -max_extent * 10, max_extent * 10)
+            else:
+                gluPerspective(45.0, aspect, 0.1, camera_distance * 10)
             
-            # Set up modelview
+            # Modelview / camera
             glMatrixMode(GL_MODELVIEW)
             glLoadIdentity()
+            if self.orthographic_view is not None:
+                if self.orthographic_view == 'xy':
+                    gluLookAt(
+                        self.bbox_center[0] + pan_x, self.bbox_center[1] + pan_y, self.bbox_center[2] + camera_distance,
+                        self.bbox_center[0] + pan_x, self.bbox_center[1] + pan_y, self.bbox_center[2],
+                        0, 1, 0
+                    )
+                elif self.orthographic_view == 'yz':
+                    gluLookAt(
+                        self.bbox_center[0] + camera_distance, self.bbox_center[1] + pan_y, self.bbox_center[2] + pan_x,
+                        self.bbox_center[0], self.bbox_center[1] + pan_y, self.bbox_center[2] + pan_x,
+                        0, 1, 0
+                    )
+                elif self.orthographic_view == 'xz':
+                    gluLookAt(
+                        self.bbox_center[0] + pan_x, self.bbox_center[1] + camera_distance, self.bbox_center[2] + pan_y,
+                        self.bbox_center[0] + pan_x, self.bbox_center[1], self.bbox_center[2] + pan_y,
+                        0, 0, -1
+                    )
+            else:
+                current_distance = camera_distance / zoom
+                dir_x = camera_x - self.bbox_center[0]
+                dir_y = camera_y - self.bbox_center[1]
+                dir_z = camera_z - self.bbox_center[2]
+                dlen = np.sqrt(dir_x*dir_x + dir_y*dir_y + dir_z*dir_z)
+                if dlen > 0.001:
+                    f = current_distance / dlen
+                    cx = self.bbox_center[0] + dir_x * f
+                    cy = self.bbox_center[1] + dir_y * f
+                    cz = self.bbox_center[2] + dir_z * f
+                else:
+                    cx, cy, cz = camera_x, camera_y, camera_z
+                gluLookAt(
+                    cx + pan_x, cy + pan_y, cz,
+                    self.bbox_center[0] + pan_x, self.bbox_center[1] + pan_y, self.bbox_center[2],
+                    0, 1, 0
+                )
+                glTranslatef(self.bbox_center[0], self.bbox_center[1], self.bbox_center[2])
+                glRotatef(rotation_x, 1, 0, 0)
+                glRotatef(rotation_y, 0, 1, 0)
+                glTranslatef(-self.bbox_center[0], -self.bbox_center[1], -self.bbox_center[2])
             
-            # Camera position
-            current_distance = camera_distance / zoom
-            gluLookAt(
-                camera_x, camera_y, camera_z,
-                self.bbox_center[0], self.bbox_center[1], self.bbox_center[2],
-                0, 1, 0
-            )
+            # Process pending measure (after matrices are set)
+            if self.orthographic_view is not None:
+                if self.pending_measure_click is not None:
+                    x_fb, y_fb, w, h = self.pending_measure_click
+                    self.pending_measure_click = None
+                    pt = self.screen_to_world_on_view_plane(x_fb, y_fb, w, h, self.orthographic_view)
+                    if pt is not None:
+                        self.measure_point1 = pt.copy()
+                        self.measure_dragging = True
+                if self.pending_measure_track is not None:
+                    x_fb, y_fb, w, h = self.pending_measure_track
+                    self.pending_measure_track = None
+                    pt = self.screen_to_world_on_view_plane(x_fb, y_fb, w, h, self.orthographic_view)
+                    if pt is not None:
+                        self.measure_point2 = pt.copy()
             
-            # Rotate around center
-            glTranslatef(self.bbox_center[0], self.bbox_center[1], self.bbox_center[2])
-            glRotatef(rotation_x, 1, 0, 0)
-            glRotatef(rotation_y, 0, 1, 0)
-            glTranslatef(-self.bbox_center[0], -self.bbox_center[1], -self.bbox_center[2])
+            # Adjusted geometry for display
+            corners = self.get_adjusted_corners()
+            adj_verts = self.get_adjusted_vertices()
+            adj_ext = self.get_adjusted_extents()
+            axis_origin = self.get_adjusted_bbox_min()
+            if adj_ext is not None:
+                glfw.set_window_title(window, f"OBJ Model - BBox: X={adj_ext[0]:.2f} Y={adj_ext[1]:.2f} Z={adj_ext[2]:.2f}")
             
-            # Draw vertices as points
-            if len(self.vertices) > 0:
+            # Draw vertices as points (adjusted)
+            if len(adj_verts) > 0:
                 glPointSize(2.0)
                 glColor3f(0.0, 0.2, 0.6)  # Darker blue for white background
                 glBegin(GL_POINTS)
-                for vertex in self.vertices:
+                for vertex in adj_verts:
                     glVertex3f(vertex[0], vertex[1], vertex[2])
                 glEnd()
             
-            # Draw bounding box wireframe
+            # Draw bounding box wireframe (adjusted corners)
             glLineWidth(2.0)
             glColor3f(0.8, 0.0, 0.0)  # Darker red for white background
             for edge in edges:
@@ -354,14 +656,8 @@ class OBJScaler:
                 glVertex3f(p2[0], p2[1], p2[2])
                 glEnd()
             
-            # Draw coordinate axes at lower front corner
-            # Lower front corner: min X, min Y, min Z (assuming Z increases going back)
-            axis_origin = np.array([
-                self.bbox_min[0],  # Lower (min X)
-                self.bbox_min[1],  # Lower (min Y)
-                self.bbox_min[2]   # Front (min Z)
-            ])
-            axis_length = np.max(self.extents) * 0.15  # Slightly smaller to fit better
+            # Draw coordinate axes at lower front corner (adjusted)
+            axis_length = np.max(adj_ext) * 0.15 if adj_ext is not None else 0.15
             glLineWidth(6.0)  # 2x thicker for better visibility
             glBegin(GL_LINES)
             # X axis - Red (pointing right/positive X)
@@ -401,8 +697,27 @@ class OBJScaler:
             glVertex3f(axis_origin[0] + arrow_size * 0.5, axis_origin[1], z_end - arrow_size)
             glEnd()
             
+            # Draw measurement line (ortho + measure mode, both points set)
+            if (self.orthographic_view is not None and self.measure_mode and
+                    self.measure_point1 is not None and self.measure_point2 is not None):
+                glLineWidth(2.0)
+                glColor3f(0.0, 0.6, 0.0)
+                glBegin(GL_LINES)
+                glVertex3f(self.measure_point1[0], self.measure_point1[1], self.measure_point1[2])
+                glVertex3f(self.measure_point2[0], self.measure_point2[1], self.measure_point2[2])
+                glEnd()
+                glPointSize(6.0)
+                glColor3f(0.0, 0.8, 0.0)
+                glBegin(GL_POINTS)
+                glVertex3f(self.measure_point1[0], self.measure_point1[1], self.measure_point1[2])
+                glVertex3f(self.measure_point2[0], self.measure_point2[1], self.measure_point2[2])
+                glEnd()
+            
             # Draw text overlay with dimensions
             self._draw_text_overlay(width, height)
+            
+            # Draw measurement overlay (length box) when measuring
+            self._draw_measurement_overlay(width, height)
             
             # Draw coordinate system indicator
             self._draw_coordinate_indicator(width, height)
@@ -458,12 +773,15 @@ class OBJScaler:
                     except:
                         font = ImageFont.load_default()
                 
+                adj_e = self.get_adjusted_extents()
                 text_lines = [
                     f"Bounding Box Dimensions:",
-                    f"X: {self.extents[0]:.6f} units",
-                    f"Y: {self.extents[1]:.6f} units",
-                    f"Z: {self.extents[2]:.6f} units"
+                    f"X: {adj_e[0]:.6f} units",
+                    f"Y: {adj_e[1]:.6f} units",
+                    f"Z: {adj_e[2]:.6f} units"
                 ]
+                if self.adjustment != 1.0:
+                    text_lines.append(f"Global adjustment: {self.adjustment:.4f}")
                 
                 y_offset = 5
                 for line in text_lines:
@@ -506,6 +824,80 @@ class OBJScaler:
         glEnable(GL_DEPTH_TEST)
         
         # Restore matrices
+        glPopMatrix()
+        glMatrixMode(GL_PROJECTION)
+        glPopMatrix()
+        glMatrixMode(GL_MODELVIEW)
+    
+    def _draw_measurement_overlay(self, width, height):
+        """Draw measurement distance box when measuring in ortho view."""
+        if not (self.measure_mode and self.orthographic_view is not None):
+            return
+        if self.measure_point1 is None:
+            return
+        if not (self.measure_point2 is not None or self.measure_dragging):
+            return
+        p2 = self.measure_point2 if self.measure_point2 is not None else self.measure_point1
+        length = float(np.linalg.norm(np.array(p2) - np.array(self.measure_point1)))
+        
+        glMatrixMode(GL_PROJECTION)
+        glPushMatrix()
+        glLoadIdentity()
+        glOrtho(0, width, height, 0, -1, 1)
+        glMatrixMode(GL_MODELVIEW)
+        glPushMatrix()
+        glLoadIdentity()
+        glDisable(GL_DEPTH_TEST)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        
+        box_x, box_y = 10, 120  # Below dimension overlay
+        box_w, box_h = 220, 36
+        glColor4f(0.0, 0.0, 0.0, 0.7)
+        glBegin(GL_QUADS)
+        glVertex2f(box_x, box_y)
+        glVertex2f(box_x + box_w, box_y)
+        glVertex2f(box_x + box_w, box_y + box_h)
+        glVertex2f(box_x, box_y + box_h)
+        glEnd()
+        
+        if PIL_AVAILABLE:
+            try:
+                font_size = 16
+                img = Image.new('RGBA', (box_w, box_h), (0, 0, 0, 0))
+                draw = ImageDraw.Draw(img)
+                try:
+                    font = ImageFont.truetype("arial.ttf", font_size)
+                except Exception:
+                    try:
+                        font = ImageFont.truetype("C:/Windows/Fonts/arial.ttf", font_size)
+                    except Exception:
+                        font = ImageFont.load_default()
+                draw.text((5, 4), f"Distance: {length:.4f} units", fill=(255, 255, 255, 255), font=font)
+                img = img.transpose(Image.FLIP_TOP_BOTTOM)
+                img_data = img.tobytes("raw", "RGBA", 0, -1)
+                texture = glGenTextures(1)
+                glBindTexture(GL_TEXTURE_2D, texture)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, box_w, box_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, img_data)
+                glEnable(GL_TEXTURE_2D)
+                glColor4f(1.0, 1.0, 1.0, 1.0)
+                glBegin(GL_QUADS)
+                glTexCoord2f(0, 0)
+                glVertex2f(box_x, box_y)
+                glTexCoord2f(1, 0)
+                glVertex2f(box_x + box_w, box_y)
+                glTexCoord2f(1, 1)
+                glVertex2f(box_x + box_w, box_y + box_h)
+                glTexCoord2f(0, 1)
+                glVertex2f(box_x, box_y + box_h)
+                glEnd()
+                glDisable(GL_TEXTURE_2D)
+                glDeleteTextures([texture])
+            except Exception:
+                pass
+        glEnable(GL_DEPTH_TEST)
         glPopMatrix()
         glMatrixMode(GL_PROJECTION)
         glPopMatrix()
@@ -665,21 +1057,22 @@ class OBJScaler:
         glMatrixMode(GL_MODELVIEW)
     
     def scale_vertices(self, target_x=None, target_y=None, target_z=None):
-        """Scale vertices based on target dimensions"""
+        """Scale vertices based on target dimensions. Uses adjusted geometry (global adjustment)."""
         if self.extents is None:
             return False
         
+        adj_extents = self.get_adjusted_extents()
+        adj_vertices = self.get_adjusted_vertices()
+        center = self.bbox_center
+        
         scale_factors = np.ones(3)
+        if target_x is not None and adj_extents[0] > 0:
+            scale_factors[0] = target_x / adj_extents[0]
+        if target_y is not None and adj_extents[1] > 0:
+            scale_factors[1] = target_y / adj_extents[1]
+        if target_z is not None and adj_extents[2] > 0:
+            scale_factors[2] = target_z / adj_extents[2]
         
-        if target_x is not None and self.extents[0] > 0:
-            scale_factors[0] = target_x / self.extents[0]
-        if target_y is not None and self.extents[1] > 0:
-            scale_factors[1] = target_y / self.extents[1]
-        if target_z is not None and self.extents[2] > 0:
-            scale_factors[2] = target_z / self.extents[2]
-        
-        # Use uniform scaling (minimum scale factor to maintain proportions)
-        # Or use the specified scale factor if only one dimension is provided
         if target_x is not None and target_y is None and target_z is None:
             uniform_scale = scale_factors[0]
         elif target_y is not None and target_x is None and target_z is None:
@@ -687,16 +1080,13 @@ class OBJScaler:
         elif target_z is not None and target_x is None and target_y is None:
             uniform_scale = scale_factors[2]
         else:
-            # If multiple dimensions specified, use minimum to maintain proportions
             active_scales = [s for i, s in enumerate(scale_factors) 
                            if (i == 0 and target_x is not None) or
                               (i == 1 and target_y is not None) or
                               (i == 2 and target_z is not None)]
             uniform_scale = min(active_scales) if active_scales else 1.0
         
-        # Scale vertices relative to center
-        scaled_vertices = (self.vertices - self.bbox_center) * uniform_scale + self.bbox_center
-        
+        scaled_vertices = (adj_vertices - center) * uniform_scale + center
         return scaled_vertices, uniform_scale
     
     def rotate_vertices_neg90_deg_x(self, vertices):
@@ -1029,14 +1419,17 @@ class ScalingGUI:
         self.batch_folder_path = None
         self.file_listbox = None
         self.file_list_scrollbar = None
+        self._s2_s3_filter_active = False
         
-        # Standard scales in mm (Y dimension)
+        # Standard scales in mm (Y dimension). None = 1:1 true scale (use model Y)
         self.standard_scales = {
             'G': 81,
             'O': 40,
             'S': 29,
             'HO': 20,
             'N': 12,
+            'DD': 32,
+            'true': None,
             '6in': 150,
             '4in': 100,
             '3in': 75
@@ -1066,6 +1459,7 @@ class ScalingGUI:
         ttk.Button(folder_frame, text="Select Folder", command=self.select_batch_folder).pack(side=tk.LEFT, padx=5)
         self.batch_folder_label = ttk.Label(folder_frame, text="No folder selected", foreground="gray")
         self.batch_folder_label.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        ttk.Button(folder_frame, text="Show only _s2/_s3", command=self.show_only_s2_s3).pack(side=tk.LEFT, padx=5)
         
         # File list with scrollbar
         list_frame = ttk.Frame(batch_frame)
@@ -1113,6 +1507,16 @@ class ScalingGUI:
         # Clear log button
         ttk.Button(log_frame, text="Clear Log", command=self.clear_log).pack(pady=5)
         
+        # Global scale adjustment (applies before any scale)
+        adj_frame = ttk.Frame(self.root, padding="10")
+        adj_frame.pack(fill=tk.X)
+        ttk.Label(adj_frame, text="Global scale adjustment:").pack(side=tk.LEFT, padx=5)
+        self.adjustment_entry = ttk.Entry(adj_frame, width=10)
+        self.adjustment_entry.insert(0, "1.0")
+        self.adjustment_entry.pack(side=tk.LEFT, padx=2)
+        ttk.Button(adj_frame, text="Apply", command=self.apply_adjustment).pack(side=tk.LEFT, padx=2)
+        ttk.Label(adj_frame, text="(1.0 = no change, 1.5 = 1.5x, 0.5 = half)", foreground="gray").pack(side=tk.LEFT, padx=5)
+        
         # Standard scales frame
         scales_frame = ttk.LabelFrame(self.root, text="Standard Scales (Y dimension in mm)", padding="10")
         scales_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -1132,6 +1536,8 @@ class ScalingGUI:
         ttk.Button(scale_row2, text="6in (150mm)", command=lambda: self.create_scale('6in')).pack(side=tk.LEFT, padx=2)
         ttk.Button(scale_row2, text="4in (100mm)", command=lambda: self.create_scale('4in')).pack(side=tk.LEFT, padx=2)
         ttk.Button(scale_row2, text="3in (75mm)", command=lambda: self.create_scale('3in')).pack(side=tk.LEFT, padx=2)
+        ttk.Button(scale_row2, text="DD 1:56 (32mm)", command=lambda: self.create_scale('DD')).pack(side=tk.LEFT, padx=2)
+        ttk.Button(scale_row2, text="True 1:1 (m)", command=lambda: self.create_scale('true')).pack(side=tk.LEFT, padx=2)
         
         # Rotation checkbox
         rotation_frame = ttk.Frame(scales_frame)
@@ -1169,6 +1575,17 @@ class ScalingGUI:
         self.z_entry = ttk.Entry(input_frame, width=15)
         self.z_entry.grid(row=0, column=5, padx=5, pady=5)
         
+        # View frame (XY/YZ/XZ, Reset, Measure)
+        view_frame = ttk.Frame(self.root, padding="10")
+        view_frame.pack(fill=tk.X)
+        ttk.Label(view_frame, text="Standard Views:").pack(side=tk.LEFT, padx=5)
+        ttk.Button(view_frame, text="XY (Top)", command=self.set_xy_view).pack(side=tk.LEFT, padx=2)
+        ttk.Button(view_frame, text="YZ (Front)", command=self.set_yz_view).pack(side=tk.LEFT, padx=2)
+        ttk.Button(view_frame, text="XZ (Side)", command=self.set_xz_view).pack(side=tk.LEFT, padx=2)
+        ttk.Button(view_frame, text="Reset View / Fit Object", command=self.reset_view).pack(side=tk.LEFT, padx=5)
+        self.measure_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(view_frame, text="Measure Distance", variable=self.measure_var, command=self.toggle_measure).pack(side=tk.LEFT, padx=5)
+        
         # Buttons frame
         button_frame = ttk.Frame(self.root, padding="10")
         button_frame.pack(fill=tk.X)
@@ -1190,6 +1607,44 @@ class ScalingGUI:
             messagebox.showerror("Error", f"Failed to scan folder: {str(e)}")
         return obj_files
     
+    def filter_s2_s3(self, paths):
+        """Keep only paths whose basename (no .obj) ends with _s2 or _s3.
+        Group by (directory, base). If both _s2 and _s3 exist for same base in same dir, keep only _s3.
+        Returns filtered list of full paths, sorted.
+        """
+        kept = []
+        for p in paths:
+            base = os.path.splitext(os.path.basename(p))[0]
+            if not (base.endswith('_s2') or base.endswith('_s3')):
+                continue
+            kept.append(p)
+        groups = {}  # (dir, base) -> list of (path, suffix)
+        for p in kept:
+            d = os.path.dirname(p)
+            stem = os.path.splitext(os.path.basename(p))[0]
+            if stem.endswith('_s3'):
+                base = stem[:-3]
+                suf = '_s3'
+            else:
+                base = stem[:-3]
+                suf = '_s2'
+            key = (d, base)
+            if key not in groups:
+                groups[key] = []
+            groups[key].append((p, suf))
+        out = []
+        for key, lst in groups.items():
+            has_s3 = any(s == '_s3' for _, s in lst)
+            if has_s3:
+                for p, s in lst:
+                    if s == '_s3':
+                        out.append(p)
+            else:
+                for p, _ in lst:
+                    out.append(p)
+        out.sort()
+        return out
+    
     def select_batch_folder(self):
         """Open folder dialog to select folder for batch processing"""
         folder_path = filedialog.askdirectory(title="Select Folder with OBJ Files")
@@ -1198,6 +1653,7 @@ class ScalingGUI:
         
         self.batch_folder_path = folder_path
         self.batch_folder_label.config(text=os.path.basename(folder_path), foreground="black")
+        self._s2_s3_filter_active = False
         
         # Scan for OBJ files
         obj_files = self.scan_folder_for_obj_files(folder_path)
@@ -1216,6 +1672,25 @@ class ScalingGUI:
         else:
             self.file_count_label.config(text="0 files found")
             messagebox.showinfo("Info", "No OBJ files found in selected folder")
+    
+    def show_only_s2_s3(self):
+        """Filter file list to _s2/_s3 only; prefer _s3 when both exist in same folder."""
+        if not self.scaler.batch_file_list:
+            messagebox.showwarning("Warning", "Select a folder first.")
+            return
+        filtered = self.filter_s2_s3(self.scaler.batch_file_list)
+        self.scaler.batch_file_list = filtered
+        self._s2_s3_filter_active = True
+        self.file_listbox.delete(0, tk.END)
+        if filtered:
+            for file_path in filtered:
+                rel_path = os.path.relpath(file_path, self.batch_folder_path)
+                self.file_listbox.insert(tk.END, rel_path)
+            self.file_count_label.config(text=f"{len(filtered)} files (filtered _s2/_s3)")
+            self.file_listbox.focus_set()
+        else:
+            self.file_count_label.config(text="0 files found")
+            messagebox.showinfo("Info", "No _s2 or _s3 files found.")
     
     def on_file_selected(self, event=None):
         """Handle file selection from listbox"""
@@ -1293,14 +1768,20 @@ class ScalingGUI:
         self.info_text.delete(1.0, tk.END)
         
         if self.scaler.extents is not None:
+            adj_e = self.scaler.get_adjusted_extents()
+            adj_min = self.scaler.get_adjusted_bbox_min()
+            adj_max = self.scaler.get_adjusted_bbox_max()
+            adj_c = self.scaler.get_adjusted_bbox_center()
             info = f"Current Extents:\n"
-            info += f"  X: {self.scaler.extents[0]:.6f} units\n"
-            info += f"  Y: {self.scaler.extents[1]:.6f} units\n"
-            info += f"  Z: {self.scaler.extents[2]:.6f} units\n\n"
+            info += f"  X: {adj_e[0]:.6f} units\n"
+            info += f"  Y: {adj_e[1]:.6f} units\n"
+            info += f"  Z: {adj_e[2]:.6f} units\n\n"
             info += f"Bounding Box:\n"
-            info += f"  Min: ({self.scaler.bbox_min[0]:.6f}, {self.scaler.bbox_min[1]:.6f}, {self.scaler.bbox_min[2]:.6f})\n"
-            info += f"  Max: ({self.scaler.bbox_max[0]:.6f}, {self.scaler.bbox_max[1]:.6f}, {self.scaler.bbox_max[2]:.6f})\n"
-            info += f"  Center: ({self.scaler.bbox_center[0]:.6f}, {self.scaler.bbox_center[1]:.6f}, {self.scaler.bbox_center[2]:.6f})\n\n"
+            info += f"  Min: ({adj_min[0]:.6f}, {adj_min[1]:.6f}, {adj_min[2]:.6f})\n"
+            info += f"  Max: ({adj_max[0]:.6f}, {adj_max[1]:.6f}, {adj_max[2]:.6f})\n"
+            info += f"  Center: ({adj_c[0]:.6f}, {adj_c[1]:.6f}, {adj_c[2]:.6f})\n\n"
+            if self.scaler.adjustment != 1.0:
+                info += f"Global adjustment: {self.scaler.adjustment:.4f}\n\n"
             info += f"Vertices: {len(self.scaler.vertices)}\n"
             info += f"Faces: {len(self.scaler.faces)}"
             
@@ -1332,6 +1813,22 @@ class ScalingGUI:
         self.log_text.delete(1.0, tk.END)
         self.log_text.config(state=tk.DISABLED)
     
+    def apply_adjustment(self):
+        """Apply global scale adjustment from Entry. Must be > 0."""
+        s = self.adjustment_entry.get().strip()
+        if not s:
+            s = "1.0"
+        try:
+            val = float(s)
+        except ValueError:
+            messagebox.showerror("Error", "Invalid value. Enter a positive number (e.g. 1.0, 1.5, 0.5).")
+            return
+        if val <= 0:
+            messagebox.showerror("Error", "Global scale adjustment must be > 0.")
+            return
+        self.scaler.adjustment = val
+        self.update_info_display()
+    
     def show_visualization(self):
         """Show 3D visualization"""
         if self.scaler.extents is None:
@@ -1339,6 +1836,38 @@ class ScalingGUI:
             return
         
         self.scaler.visualize_bounding_box()
+    
+    def set_xy_view(self):
+        """Set view to XY plane (top)"""
+        if self.scaler.extents is None:
+            messagebox.showwarning("Warning", "Please load an OBJ file first")
+            return
+        self.scaler.view_xy_flag = True
+    
+    def set_yz_view(self):
+        """Set view to YZ plane (front)"""
+        if self.scaler.extents is None:
+            messagebox.showwarning("Warning", "Please load an OBJ file first")
+            return
+        self.scaler.view_yz_flag = True
+    
+    def set_xz_view(self):
+        """Set view to XZ plane (side)"""
+        if self.scaler.extents is None:
+            messagebox.showwarning("Warning", "Please load an OBJ file first")
+            return
+        self.scaler.view_xz_flag = True
+    
+    def reset_view(self):
+        """Reset camera view to fit object; return to perspective"""
+        if self.scaler.extents is None:
+            messagebox.showwarning("Warning", "Please load an OBJ file first")
+            return
+        self.scaler.reset_view_flag = True
+    
+    def toggle_measure(self):
+        """Toggle measure distance mode"""
+        self.scaler.measure_mode = self.measure_var.get()
     
     def scale_and_save(self):
         """Scale and save the OBJ file"""
@@ -1388,9 +1917,12 @@ class ScalingGUI:
                               f"Scaled OBJ saved to:\n{output_path}\n\n"
                               f"Scale factor: {scale_factor:.6f}")
             
-            # Update display with new extents
+            # Update display with new extents; reset adjustment so display matches new base
             self.scaler.vertices = scaled_vertices
             self.scaler.calculate_bounding_box()
+            self.scaler.adjustment = 1.0
+            self.adjustment_entry.delete(0, tk.END)
+            self.adjustment_entry.insert(0, "1.0")
             self.update_info_display()
     
     def is_scaled_file(self, file_path):
@@ -1420,6 +1952,91 @@ class ScalingGUI:
         
         return original_files
     
+    def get_files_to_process(self):
+        """Files to use for Run All / Process all in folder.
+        When _s2/_s3 filter is active, use exactly what's shown (batch_file_list).
+        Otherwise use get_original_files() (exclude scaled)."""
+        if not self.scaler.batch_file_list:
+            return []
+        if self._s2_s3_filter_active:
+            return list(self.scaler.batch_file_list)
+        return self.get_original_files()
+    
+    def find_session_metadata_path(self, obj_dir):
+        """Look for session_metadata.json in the parent of obj_dir. Return path or None."""
+        parent = os.path.normpath(os.path.join(obj_dir, ".."))
+        path = os.path.join(parent, "session_metadata.json")
+        return path if os.path.isfile(path) else None
+    
+    def parse_scale_from_notes(self, notes_str):
+        """Parse notes for scale=xx (ratio) and scale=yy mm / scale=yymm. Returns list of
+        {"kind": "ratio"|"mm", "value": float}. Validates > 0, deduplicates by (kind, value)."""
+        if not notes_str or not isinstance(notes_str, str):
+            return []
+        seen = set()
+        out = []
+        # MM: scale=N mm or scale=Nmm
+        for m in re.finditer(r'scale\s*=\s*(\d+(?:\.\d+)?)\s*mm\b', notes_str, re.IGNORECASE):
+            v = float(m.group(1))
+            if v > 0 and ("mm", v) not in seen:
+                seen.add(("mm", v))
+                out.append({"kind": "mm", "value": v})
+        # Ratio: scale=N where N is not followed by optional space and "mm"
+        # Use a positive constraint: number must be followed by \s*[\s,;.$]|$ to avoid
+        # matching "5" in "scale=50 mm" (after 5 we have "0", not space/end)
+        for m in re.finditer(r'scale\s*=\s*(\d+(?:\.\d+)?)(?=\s*[\s,;.]|\s*$)', notes_str, re.IGNORECASE):
+            after = notes_str[m.end():m.end() + 10]
+            if re.match(r'\s*mm\b', after, re.IGNORECASE):
+                continue  # skip: this is the mm case
+            v = float(m.group(1))
+            if v > 0 and ("ratio", v) not in seen:
+                seen.add(("ratio", v))
+                out.append({"kind": "ratio", "value": v})
+        return out
+    
+    def get_metadata_scale_specs(self, file_path):
+        """Find session_metadata.json in parent of OBJ dir, read notes, parse scale=.
+        Returns list of {"kind":"ratio"|"mm", "value":float} or []."""
+        obj_dir = os.path.dirname(file_path)
+        meta_path = self.find_session_metadata_path(obj_dir)
+        if not meta_path:
+            return []
+        try:
+            with open(meta_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
+        notes = data.get("notes") if isinstance(data, dict) else None
+        return self.parse_scale_from_notes(notes)
+    
+    def _value_to_scale_suffix(self, value, mm=False):
+        """Convert numeric value to scale_name part: decimals become _. E.g. 13.7 -> '13_7', 10 -> '10'."""
+        v = float(value)
+        s = str(int(v)) if v == int(v) else str(v).replace(".", "_")
+        return f"c{s}mm" if mm else f"c{s}"
+    
+    def get_metadata_scales_to_create(self, specs):
+        """Given parse specs from get_metadata_scale_specs, and with scaler loaded (extents available),
+        return [(target_y, scale_name), ...]. Ratio: target_y = current_Y / value; mm: target_y = value."""
+        if not specs or self.scaler.extents is None:
+            return []
+        current_y = self.scaler.get_adjusted_extents()[1]
+        result = []
+        seen = set()
+        for s in specs:
+            if s["kind"] == "ratio":
+                v = s["value"]
+                target_y = current_y / v
+                name = self._value_to_scale_suffix(v, mm=False)
+            else:
+                target_y = s["value"]
+                name = self._value_to_scale_suffix(s["value"], mm=True)
+            key = (target_y, name)
+            if key not in seen:
+                seen.add(key)
+                result.append(key)
+        return result
+    
     def create_scale_for_file(self, file_path, scale_name, suppress_dialogs=False):
         """Create a scaled file for a specific file and scale name"""
         # Load the file
@@ -1435,6 +2052,8 @@ class ScalingGUI:
             return False
         
         target_y = self.standard_scales[scale_name]
+        if target_y is None:
+            target_y = self.scaler.get_adjusted_extents()[1]
         
         # Get output directory (scaled subdirectory of original file's directory)
         obj_dir = os.path.dirname(file_path)
@@ -1446,7 +2065,28 @@ class ScalingGUI:
         # Create scaled file
         success, output_path = self.scaler.create_scaled_file_with_mtl(target_y, scale_name, output_dir, rotate=rotate, suppress_dialogs=suppress_dialogs)
         
+        # Metadata-driven scales from session_metadata.json notes (scale=xx, scale=yy mm)
+        self.create_metadata_scales_for_file(file_path, suppress_dialogs=suppress_dialogs,
+            log_message_fn=self.log_message if suppress_dialogs else None)
+        
         return success
+    
+    def create_metadata_scales_for_file(self, file_path, suppress_dialogs=False, log_message_fn=None):
+        """If session_metadata.json in parent of OBJ dir has scale= in notes, create those scales.
+        Scaler must already be loaded with this file. output_dir=obj_dir/scaled, rotate from checkbox."""
+        specs = self.get_metadata_scale_specs(file_path)
+        if not specs:
+            return
+        scales = self.get_metadata_scales_to_create(specs)
+        if not scales:
+            return
+        obj_dir = os.path.dirname(file_path)
+        output_dir = os.path.join(obj_dir, "scaled")
+        rotate = self.rotate_checkbox_var.get()
+        for ty, name in scales:
+            ok, _ = self.scaler.create_scaled_file_with_mtl(ty, name, output_dir, rotate=rotate, suppress_dialogs=suppress_dialogs)
+            if log_message_fn and ok:
+                log_message_fn(f"  ✓ Created {name} from metadata")
     
     def create_scale(self, scale_name):
         """Create a scaled file for the given scale name"""
@@ -1458,26 +2098,27 @@ class ScalingGUI:
         run_all = self.run_all_checkbox_var.get()
         
         if run_all:
-            # Process all original files in the folder
-            original_files = self.get_original_files()
+            # Process all files (filtered _s2/_s3 list when that filter is on, else originals only)
+            files_to_process = self.get_files_to_process()
             
-            if not original_files:
-                messagebox.showwarning("Warning", "No original OBJ files found in folder")
+            if not files_to_process:
+                messagebox.showwarning("Warning", "No OBJ files to process in folder")
                 return
             
             # Clear log and start batch processing
             self.clear_log()
-            self.log_message(f"Starting batch processing: Scale {scale_name} ({self.standard_scales[scale_name]}mm)")
-            self.log_message(f"Found {len(original_files)} files to process")
+            desc = "1:1 (m)" if self.standard_scales[scale_name] is None else f"{self.standard_scales[scale_name]}mm"
+            self.log_message(f"Starting batch processing: Scale {scale_name} ({desc})")
+            self.log_message(f"Found {len(files_to_process)} files to process")
             self.log_message("-" * 60)
             
             # Batch process all files
             processed = 0
             failed = 0
             
-            for i, file_path in enumerate(original_files, 1):
+            for i, file_path in enumerate(files_to_process, 1):
                 file_name = os.path.basename(file_path)
-                self.log_message(f"[{i}/{len(original_files)}] Processing: {file_name}")
+                self.log_message(f"[{i}/{len(files_to_process)}] Processing: {file_name}")
                 self.root.update_idletasks()
                 
                 if self.create_scale_for_file(file_path, scale_name, suppress_dialogs=True):
@@ -1494,10 +2135,11 @@ class ScalingGUI:
             self.log_message(f"  Failed: {failed} files")
             
             # Also show summary dialog
+            desc = "1:1 (m)" if self.standard_scales[scale_name] is None else f"{self.standard_scales[scale_name]}mm"
             messagebox.showinfo("Batch Processing Complete", 
                               f"Processed {processed} files successfully\n"
                               f"Failed: {failed} files\n\n"
-                              f"Scale: {scale_name} ({self.standard_scales[scale_name]}mm)")
+                              f"Scale: {scale_name} ({desc})")
         else:
             # Process current file only
             if self.scaler.extents is None:
@@ -1505,6 +2147,8 @@ class ScalingGUI:
                 return
             
             target_y = self.standard_scales[scale_name]
+            if target_y is None:
+                target_y = self.scaler.get_adjusted_extents()[1]
             
             # Get output directory (scaled subdirectory of original file's directory)
             obj_dir = os.path.dirname(self.scaler.obj_path)
@@ -1517,10 +2161,12 @@ class ScalingGUI:
             success, output_path = self.scaler.create_scaled_file_with_mtl(target_y, scale_name, output_dir, rotate=rotate)
             
             if success:
+                self.create_metadata_scales_for_file(self.scaler.obj_path, suppress_dialogs=False, log_message_fn=None)
                 rotate_text = " (rotated -90° about X)" if rotate else ""
+                desc = "1:1 (m)" if self.standard_scales[scale_name] is None else f"{target_y}mm Y dimension"
                 messagebox.showinfo("Success", 
                                   f"Scaled file created:\n{os.path.basename(output_path)}\n\n"
-                                  f"Scale: {scale_name} ({target_y}mm Y dimension){rotate_text}\n"
+                                  f"Scale: {scale_name} ({desc}){rotate_text}\n"
                                   f"Saved to: {output_dir}")
             else:
                 messagebox.showerror("Error", f"Failed to create scaled file for {scale_name}")
@@ -1531,11 +2177,11 @@ class ScalingGUI:
         run_all = self.run_all_checkbox_var.get()
         
         if run_all:
-            # Process all original files in the folder
-            original_files = self.get_original_files()
+            # Process all files (filtered _s2/_s3 list when that filter is on, else originals only)
+            files_to_process = self.get_files_to_process()
             
-            if not original_files:
-                messagebox.showwarning("Warning", "No original OBJ files found in folder")
+            if not files_to_process:
+                messagebox.showwarning("Warning", "No OBJ files to process in folder")
                 return
             
             # Get rotation setting from checkbox
@@ -1545,7 +2191,7 @@ class ScalingGUI:
             # Clear log and start batch processing
             self.clear_log()
             self.log_message(f"Starting batch processing: All scales{rotate_text}")
-            self.log_message(f"Found {len(original_files)} files to process")
+            self.log_message(f"Found {len(files_to_process)} files to process")
             self.log_message("-" * 60)
             
             # Batch process all files with all scales
@@ -1554,9 +2200,9 @@ class ScalingGUI:
             files_processed = 0
             files_failed = 0
             
-            for file_idx, file_path in enumerate(original_files, 1):
+            for file_idx, file_path in enumerate(files_to_process, 1):
                 file_name = os.path.basename(file_path)
-                self.log_message(f"\n[{file_idx}/{len(original_files)}] Processing: {file_name}")
+                self.log_message(f"\n[{file_idx}/{len(files_to_process)}] Processing: {file_name}")
                 self.root.update_idletasks()
                 
                 file_success = True
@@ -1579,11 +2225,12 @@ class ScalingGUI:
                 
                 # Create all scales for this file
                 for scale_name, target_y in self.standard_scales.items():
+                    ty = self.scaler.get_adjusted_extents()[1] if target_y is None else target_y
                     self.log_message(f"  Creating {scale_name} scale...", newline=False)
                     self.root.update_idletasks()
                     
                     success, output_path = self.scaler.create_scaled_file_with_mtl(
-                        target_y, scale_name, output_dir, rotate=rotate, suppress_dialogs=True
+                        ty, scale_name, output_dir, rotate=rotate, suppress_dialogs=True
                     )
                     if success:
                         file_created.append(scale_name)
@@ -1594,6 +2241,8 @@ class ScalingGUI:
                         total_failed += 1
                         file_success = False
                         self.log_message(f" ✗")
+                
+                self.create_metadata_scales_for_file(file_path, suppress_dialogs=True, log_message_fn=self.log_message)
                 
                 if file_success:
                     files_processed += 1
@@ -1639,11 +2288,14 @@ class ScalingGUI:
             failed = []
             
             for scale_name, target_y in self.standard_scales.items():
-                success, output_path = self.scaler.create_scaled_file_with_mtl(target_y, scale_name, output_dir, rotate=rotate)
+                ty = self.scaler.get_adjusted_extents()[1] if target_y is None else target_y
+                success, output_path = self.scaler.create_scaled_file_with_mtl(ty, scale_name, output_dir, rotate=rotate)
                 if success:
                     created.append(scale_name)
                 else:
                     failed.append(scale_name)
+            
+            self.create_metadata_scales_for_file(self.scaler.obj_path, suppress_dialogs=False, log_message_fn=None)
             
             # Show results
             rotate_text = " (rotated -90° about X)" if rotate else ""
